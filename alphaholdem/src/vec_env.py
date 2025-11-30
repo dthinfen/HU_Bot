@@ -87,7 +87,16 @@ class VectorizedHeadsUpEnv:
         reset_mask = np.zeros(self.num_envs, dtype=bool)
 
         for i, env in enumerate(self.envs):
-            if self.dones[i] or env.state.is_terminal():
+            # Reset if done, terminal, or if action mask would be empty
+            needs_reset = self.dones[i] or env.state.is_terminal()
+
+            if not needs_reset:
+                # Also check if action mask is empty (shouldn't happen but safety check)
+                mask = env.get_action_mask()
+                if not mask.any():
+                    needs_reset = True
+
+            if needs_reset:
                 env.reset()
                 if self._opponent_policy is not None:
                     env.set_opponent(self._opponent_policy)
@@ -96,6 +105,10 @@ class VectorizedHeadsUpEnv:
 
             obs = self._get_obs(env)
             mask = env.get_action_mask()
+
+            # Safety: ensure at least one action is valid
+            if not mask.any():
+                mask[1] = True  # Fallback to call (should never happen after reset)
 
             observations.append(obs)
             action_masks.append(mask)
