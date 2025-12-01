@@ -43,7 +43,9 @@ def get_raw_state_dict(model):
 @dataclass
 class TrainConfig:
     """Training configuration."""
-    starting_stack: float = 100.0
+    starting_stack: float = 100.0  # Default/max stack
+    min_stack: float = 10.0  # Minimum stack for variation
+    vary_stacks: bool = True  # Whether to vary stack sizes
     num_actions: int = 14
 
     # Vectorized training - more envs = better GPU batching
@@ -96,19 +98,40 @@ class TrainConfig:
 class CppVectorizedEnv:
     """Vectorized environment using C++ FastEnv instances with BATCHED opponent inference."""
 
-    def __init__(self, num_envs: int, starting_stack: float, num_actions: int):
+    def __init__(self, num_envs: int, starting_stack: float, num_actions: int,
+                 vary_stacks: bool = True, min_stack: float = 10.0):
         self.num_envs = num_envs
         self.starting_stack = starting_stack
         self.num_actions = num_actions
+        self.vary_stacks = vary_stacks
+        self.min_stack = min_stack
 
-        # Create C++ environments
-        self.envs = [ares_solver.FastEnv(starting_stack, num_actions) for _ in range(num_envs)]
+        # Stack sizes to use (common tournament/cash game depths)
+        # Distribution weighted towards medium stacks where most play happens
+        if vary_stacks:
+            self.stack_sizes = [10, 15, 20, 25, 30, 40, 50, 75, 100]
+            self.stack_sizes = [s for s in self.stack_sizes if min_stack <= s <= starting_stack]
+            if not self.stack_sizes:
+                self.stack_sizes = [starting_stack]
+        else:
+            self.stack_sizes = [starting_stack]
+
+        # Create C++ environments with varying stack sizes
+        self.envs = []
+        self.env_stacks = []  # Track which stack each env uses
+        for i in range(num_envs):
+            stack = self.stack_sizes[i % len(self.stack_sizes)]
+            self.envs.append(ares_solver.FastEnv(float(stack), num_actions))
+            self.env_stacks.append(stack)
+
         self.dones = np.zeros(num_envs, dtype=bool)
 
         # Opponent model for batched inference (set by trainer)
         self.opponent_model = None
         self.opponent_device = 'cpu'
         self.use_amp = False  # Mixed precision flag
+
+        print(f"Created {num_envs} envs with stack sizes: {sorted(set(self.env_stacks))}")
 
     def set_opponent_model(self, model, device, use_amp=False):
         """Set opponent model for BATCHED inference (fast!)."""
@@ -355,14 +378,27 @@ class VectorizedRolloutBuffer:
 class VectorizedEvaluator:
     """Fast vectorized evaluation for ELO calculation."""
 
-    def __init__(self, num_envs: int, starting_stack: float, num_actions: int, device: str):
+    def __init__(self, num_envs: int, starting_stack: float, num_actions: int, device: str,
+                 vary_stacks: bool = True, min_stack: float = 10.0):
         self.num_envs = num_envs
         self.starting_stack = starting_stack
         self.num_actions = num_actions
         self.device = device
 
-        # Create C++ environments
-        self.envs = [ares_solver.FastEnv(starting_stack, num_actions) for _ in range(num_envs)]
+        # Stack sizes to use for evaluation (same as training for fair eval)
+        if vary_stacks:
+            stack_sizes = [10, 15, 20, 25, 30, 40, 50, 75, 100]
+            stack_sizes = [s for s in stack_sizes if min_stack <= s <= starting_stack]
+            if not stack_sizes:
+                stack_sizes = [starting_stack]
+        else:
+            stack_sizes = [starting_stack]
+
+        # Create C++ environments with varying stack sizes
+        self.envs = []
+        for i in range(num_envs):
+            stack = stack_sizes[i % len(stack_sizes)]
+            self.envs.append(ares_solver.FastEnv(float(stack), num_actions))
         self.dones = np.zeros(num_envs, dtype=bool)
 
     def evaluate_matchup(self, hero_model: ActorCritic, opponent_model: ActorCritic,
@@ -604,12 +640,14 @@ class CppTrainer:
             raise RuntimeError("C++ FastEnv not available. Build cpp_solver first.")
 
         self.vec_env = CppVectorizedEnv(
-            config.num_envs, config.starting_stack, config.num_actions
+            config.num_envs, config.starting_stack, config.num_actions,
+            vary_stacks=config.vary_stacks, min_stack=config.min_stack
         )
 
         # Vectorized evaluation for fast ELO calculation
         self.evaluator = VectorizedEvaluator(
-            config.eval_num_envs, config.starting_stack, config.num_actions, self.device
+            config.eval_num_envs, config.starting_stack, config.num_actions, self.device,
+            vary_stacks=config.vary_stacks, min_stack=config.min_stack
         )
 
         # Buffer
@@ -1015,7 +1053,9 @@ def main():
     parser = argparse.ArgumentParser(description="Train AlphaHoldem with C++ acceleration")
     parser.add_argument('--timesteps', type=int, default=100_000_000)
     parser.add_argument('--num-envs', type=int, default=256)
-    parser.add_argument('--stack', type=float, default=100.0)
+    parser.add_argument('--stack', type=float, default=100.0, help="Max starting stack (bb)")
+    parser.add_argument('--min-stack', type=float, default=10.0, help="Min starting stack (bb)")
+    parser.add_argument('--no-vary-stacks', action='store_true', help="Disable stack size variation")
     parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--checkpoint-dir', type=str, default='alphaholdem/checkpoints')
     parser.add_argument('--log-dir', type=str, default='alphaholdem/logs')
@@ -1034,6 +1074,8 @@ def main():
 
     config = TrainConfig(
         starting_stack=args.stack,
+        min_stack=args.min_stack,
+        vary_stacks=not args.no_vary_stacks,
         total_timesteps=args.timesteps,
         num_envs=args.num_envs,
         checkpoint_dir=args.checkpoint_dir,
