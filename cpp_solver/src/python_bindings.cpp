@@ -964,17 +964,28 @@ private:
         bool facing_allin = (state_.stack(opp) < 0.01f && to_call_amt > 0);
         fill_plane(23, facing_allin ? 1.0f : 0.0f);
 
-        // [24-27] Pot/stack ratios
-        float total_chips = state_.pot() + state_.stack(0) + state_.stack(1);
+        // [24-27] Pot/stack ratios - CRITICAL for decision making
+        float hero_stack = state_.stack(player);
+        float villain_stack = state_.stack(1 - player);
+        float effective_stack = std::min(hero_stack, villain_stack);
+
+        // Plane 24: hero stack / starting stack
+        fill_plane(24, hero_stack / stack_size_);
+
+        // Plane 25: villain stack / starting stack
+        fill_plane(25, villain_stack / stack_size_);
+
+        // Plane 26: SPR (Stack-to-Pot Ratio) = effective_stack / pot
+        // This is THE key metric for commitment decisions
+        // Low SPR (<3): often commit, high SPR (>10): room for maneuvering
+        float spr = effective_stack / std::max(pot, 1.0f);
+        fill_plane(26, std::min(spr / 10.0f, 1.0f));  // Normalize, cap at SPR=10
+
+        // Plane 27: Pot as fraction of total chips in play
+        float total_chips = state_.pot() + hero_stack + villain_stack;
         if (total_chips > 0) {
-            fill_plane(24, state_.pot() / total_chips);
+            fill_plane(27, state_.pot() / total_chips);
         }
-        fill_plane(25, state_.stack(player) / stack_size_);
-        fill_plane(26, state_.stack(1 - player) / stack_size_);
-        // Plane 27: total invested normalized
-        float hero_invested = stack_size_ - state_.stack(player);
-        float villain_invested = stack_size_ - state_.stack(1 - player);
-        fill_plane(27, (hero_invested + villain_invested) / (2 * stack_size_));
 
         // [28-49] Betting history (last 22 actions - enough for any HU hand)
         // Encodes action type, amount, and who acted
@@ -1014,6 +1025,16 @@ private:
             bool is_hero_action = (action.player == player);
             for (int r = 0; r < W; ++r) {
                 set_obs(channel, 2, r, is_hero_action ? 1.0f : 0.0f);
+            }
+
+            // Street indicator (row 3) - CRITICAL for knowing when actions happened
+            // Encodes which street (0-3) this action occurred on
+            // This helps the model distinguish preflop raises from river raises
+            uint8_t action_street = action.street;
+            if (action_street < 4) {  // Valid street (0-3)
+                for (int r = 0; r < W; ++r) {
+                    set_obs(channel, 3, r, action_street / 3.0f);  // Normalize to 0-1
+                }
             }
         }
 

@@ -140,13 +140,24 @@ class AlphaHoldemEncoder:
         facing_allin = (villain_stack < 0.01 and to_call > 0)
         tensor[23, :, :] = 1.0 if facing_allin else 0.0
 
-        # Pot/stack info (channels 24-27)
+        # Pot/stack info (channels 24-27) - CRITICAL for decision making
+        effective_stack = min(hero_stack, villain_stack)
+
+        # Plane 24: hero stack / starting stack
+        tensor[24, :, :] = hero_stack / starting_stack
+
+        # Plane 25: villain stack / starting stack
+        tensor[25, :, :] = villain_stack / starting_stack
+
+        # Plane 26: SPR (Stack-to-Pot Ratio) = effective_stack / pot
+        # This is THE key metric for commitment decisions
+        spr = effective_stack / max(pot, 1.0)
+        tensor[26, :, :] = min(spr / 10.0, 1.0)  # Normalize, cap at SPR=10
+
+        # Plane 27: Pot as fraction of total chips in play
         total_chips = pot + hero_stack + villain_stack
         if total_chips > 0:
-            tensor[24, :, :] = pot / total_chips
-            tensor[25, :, :] = hero_stack / starting_stack
-            tensor[26, :, :] = villain_stack / starting_stack
-            tensor[27, :, :] = (hero_invested + villain_invested) / (2 * starting_stack)
+            tensor[27, :, :] = pot / total_chips
 
         # Betting history (channels 28-49) - last 22 actions
         for i, (action_type, amount) in enumerate(action_history[-self.MAX_HISTORY:]):
