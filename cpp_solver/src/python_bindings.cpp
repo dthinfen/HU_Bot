@@ -564,7 +564,8 @@ private:
 class FastPokerEnv {
 public:
     FastPokerEnv(float stack_size = 100.0f, int num_actions = 14)
-        : stack_size_(stack_size), num_actions_(num_actions), rng_(std::random_device{}()) {
+        : stack_size_(stack_size), num_actions_(num_actions), rng_(std::random_device{}()),
+          state_(HoldemState::create_initial(HoldemConfig{stack_size, 0.5f, 1.0f})) {
         static bool initialized = false;
         if (!initialized) {
             HandEvaluator::initialize();
@@ -678,11 +679,12 @@ public:
      * Returns: numpy array of bools (num_actions,)
      */
     py::array_t<bool> get_action_mask() {
-        std::vector<bool> mask(num_actions_, false);
+        // Use uint8_t instead of bool for numpy compatibility
+        std::vector<uint8_t> mask(num_actions_, 0);
 
         if (state_.is_terminal() || state_.is_chance_node()) {
-            mask[1] = true;  // Default to call/check
-            return py::array_t<bool>(mask.size(), mask.data());
+            mask[1] = 1;  // Default to call/check
+            return py::array_t<bool>(mask.size(), reinterpret_cast<bool*>(mask.data()));
         }
 
         std::vector<Action> legal = state_.get_legal_actions();
@@ -690,16 +692,16 @@ public:
         for (const auto& action : legal) {
             int idx = action_to_index(action);
             if (idx >= 0 && idx < num_actions_) {
-                mask[idx] = true;
+                mask[idx] = 1;
             }
         }
 
         // Ensure at least one action is valid
         bool any_valid = false;
-        for (bool b : mask) any_valid |= b;
-        if (!any_valid) mask[1] = true;
+        for (auto b : mask) any_valid |= (b != 0);
+        if (!any_valid) mask[1] = 1;
 
-        return py::array_t<bool>(mask.size(), mask.data());
+        return py::array_t<bool>(mask.size(), reinterpret_cast<bool*>(mask.data()));
     }
 
     /**
@@ -751,18 +753,19 @@ private:
         for (int i = 0; i < 2; ++i) {
             Card c = hand[i];
             if (c != NO_CARD) {
-                int rank = card_rank(c);
-                int suit = card_suit(c);
+                int rank = get_rank_int(c);
+                int suit = get_suit_int(c);
                 obs[i * 52 + suit * 13 + rank] = 1.0f;
             }
         }
 
         // Encode board (planes 2-6)
-        for (int i = 0; i < 5; ++i) {
-            Card c = state_.board_card(i);
+        const auto& board = state_.board();
+        for (int i = 0; i < state_.board_count(); ++i) {
+            Card c = board[i];
             if (c != NO_CARD) {
-                int rank = card_rank(c);
-                int suit = card_suit(c);
+                int rank = get_rank_int(c);
+                int suit = get_suit_int(c);
                 obs[(2 + i) * 52 + suit * 13 + rank] = 1.0f;
             }
         }
@@ -791,7 +794,27 @@ private:
     py::array_t<bool> get_action_mask_for_player(int player) {
         // Simplified - same logic as get_action_mask but for any player
         (void)player;  // Currently same for both players
-        return get_action_mask();
+        // Use uint8_t instead of bool for numpy compatibility
+        std::vector<uint8_t> mask(num_actions_, 0);
+
+        if (state_.is_terminal() || state_.is_chance_node()) {
+            mask[1] = 1;
+            return py::array_t<bool>(mask.size(), reinterpret_cast<bool*>(mask.data()));
+        }
+
+        std::vector<Action> legal = state_.get_legal_actions();
+        for (const auto& action : legal) {
+            int idx = action_to_index(action);
+            if (idx >= 0 && idx < num_actions_) {
+                mask[idx] = 1;
+            }
+        }
+
+        bool any_valid = false;
+        for (auto b : mask) any_valid |= (b != 0);
+        if (!any_valid) mask[1] = 1;
+
+        return py::array_t<bool>(mask.size(), reinterpret_cast<bool*>(mask.data()));
     }
 
     int action_to_index(const Action& action) {
