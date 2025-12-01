@@ -1,0 +1,6 @@
+Agent: C++ CFR Agent
+Opponent: Call/Fold Opponent
+Hands: 5000
+Stack: 20.0bb
+Win rate: +14.15 bb/100
+Rating: ➖ BREAKEVEN - about even

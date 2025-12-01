@@ -61,24 +61,17 @@ alphaholdem/
 └── logs/                # TensorBoard logs
 ```
 
-## Key Config (verified against paper)
+## Key Config (in train.py)
 
 ```python
-# Network (paper: 8.6M params = 1.8M Conv + 6.8M FC)
-fc_hidden_dim: int = 1024           # FC layer width
-fc_num_layers: int = 4              # FC layer depth (~6.8M FC params)
-
-# PPO (paper values)
-gamma: float = 0.999                # Discount factor (paper: 0.999)
-clip_ratio: float = 3.0             # Trinal-Clip δ1=3 (NOT 0.2!)
-gae_lambda: float = 0.95            # GAE parameter (paper: λ=0.95)
-batch_size: int = 2048              # Per GPU (paper: 2048 x 8 GPUs)
-learning_rate: float = 3e-4         # Adam LR (paper: 0.0003)
-
-# ELO-based K-Best selection
-k_best: int = 5                     # Keep 5 best agents by ELO
-elo_games_per_matchup: int = 100    # Games per matchup for ELO
-initial_elo: float = 1500.0         # Starting ELO (standard)
+# Following AlphaHoldem paper (ELO-based selection):
+k_best: int = 5                     # Keep 5 best agents by ELO (same as paper)
+elo_games_per_matchup: int = 100    # Games per matchup for ELO calculation
+initial_elo: float = 1500.0         # Starting ELO for new agents
+elo_k_factor: float = 32.0          # ELO K-factor (rating change sensitivity)
+eval_for_pool_every: int = 50       # Evaluate for pool admission every N updates
+min_hands_for_pool: int = 50_000    # Warmup before self-play starts
+update_opponent_every: int = 10     # Switch opponent frequency
 ```
 
 **Pool Admission (AlphaHoldem ELO method):**

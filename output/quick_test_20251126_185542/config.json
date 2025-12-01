@@ -1,0 +1,17 @@
+{
+  "name": "quick_test",
+  "version": "1.0.0",
+  "stack_size": 20.0,
+  "cfr_iterations": 5000,
+  "preflop_buckets": 20,
+  "postflop_buckets": 45,
+  "cfr_checkpoint_freq": 1000,
+  "defer_policy_averaging": 1000,
+  "neural_train_examples": 10000,
+  "neural_epochs": 20,
+  "neural_batch_size": 256,
+  "neural_learning_rate": 0.001,
+  "cfr_for_neural": 5000,
+  "output_dir": "output",
+  "save_checkpoints": true
+}

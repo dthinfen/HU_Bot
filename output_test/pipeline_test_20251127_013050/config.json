@@ -1,0 +1,17 @@
+{
+  "name": "pipeline_test",
+  "version": "1.0.0",
+  "stack_size": 20.0,
+  "cfr_iterations": 500,
+  "preflop_buckets": 20,
+  "postflop_buckets": 45,
+  "cfr_checkpoint_freq": 10000,
+  "defer_policy_averaging": 1000,
+  "neural_train_examples": 1000,
+  "neural_epochs": 5,
+  "neural_batch_size": 256,
+  "neural_learning_rate": 0.001,
+  "cfr_for_neural": 10000,
+  "output_dir": "output_test",
+  "save_checkpoints": true
+}

@@ -32,3 +32,11 @@ cpp_solver/build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Large binary files - too big for GitHub
+blueprints/**/*.bin
+data/*.bin
+data/*.npz
+models/*.pt
+models/*.torchscript
+*.dSYM/
