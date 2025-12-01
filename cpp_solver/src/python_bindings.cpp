@@ -557,8 +557,272 @@ private:
 };
 
 
+/**
+ * Fast RL Environment for training - exposes gym-like interface.
+ * This is what you need for PPO/RL training with C++ speed.
+ */
+class FastPokerEnv {
+public:
+    FastPokerEnv(float stack_size = 100.0f, int num_actions = 14)
+        : stack_size_(stack_size), num_actions_(num_actions), rng_(std::random_device{}()) {
+        static bool initialized = false;
+        if (!initialized) {
+            HandEvaluator::initialize();
+            initialized = true;
+        }
+        reset();
+    }
+
+    /**
+     * Reset environment to new hand.
+     * Returns: observation as numpy array (38, 4, 13)
+     */
+    py::array_t<float> reset() {
+        HoldemConfig config;
+        config.starting_stack = stack_size_;
+        config.big_blind = 1.0f;
+        config.small_blind = 0.5f;
+
+        state_ = HoldemState::create_initial(config);
+
+        // Deal random hole cards
+        if (state_.is_chance_node()) {
+            state_ = state_.deal_random(rng_);
+        }
+
+        hero_player_ = 0;  // Hero is always player 0 (button)
+        cumulative_reward_ = 0.0f;
+
+        return get_observation();
+    }
+
+    /**
+     * Step environment with action.
+     * Args:
+     *     action: Action index (0=fold, 1=call/check, 2+=raise sizes)
+     * Returns:
+     *     Tuple of (observation, reward, done, info_dict)
+     */
+    py::tuple step(int action_idx) {
+        if (state_.is_terminal()) {
+            float reward = state_.utility(hero_player_);
+            return py::make_tuple(get_observation(), reward, true, py::dict());
+        }
+
+        // Handle chance nodes (deal board cards)
+        while (state_.is_chance_node() && !state_.is_terminal()) {
+            state_ = state_.deal_random(rng_);
+        }
+
+        if (state_.is_terminal()) {
+            float reward = state_.utility(hero_player_);
+            return py::make_tuple(get_observation(), reward, true, py::dict());
+        }
+
+        // Get legal actions and map index to action
+        std::vector<Action> legal = state_.get_legal_actions();
+        if (legal.empty()) {
+            return py::make_tuple(get_observation(), 0.0f, true, py::dict());
+        }
+
+        // Clamp action index to valid range
+        int clamped_idx = std::min(action_idx, static_cast<int>(legal.size()) - 1);
+        clamped_idx = std::max(clamped_idx, 0);
+
+        Action chosen = legal[clamped_idx];
+
+        // Apply hero's action
+        state_ = state_.apply_action(chosen);
+
+        // Handle chance nodes and opponent
+        while (!state_.is_terminal()) {
+            if (state_.is_chance_node()) {
+                state_ = state_.deal_random(rng_);
+                continue;
+            }
+
+            if (state_.current_player() != hero_player_) {
+                // Opponent acts (simple policy - can be replaced)
+                std::vector<Action> opp_actions = state_.get_legal_actions();
+                if (opp_actions.empty()) break;
+
+                // Use callback if set, otherwise random
+                Action opp_action;
+                if (opponent_callback_) {
+                    auto obs = get_observation_for_player(1 - hero_player_);
+                    auto mask = get_action_mask_for_player(1 - hero_player_);
+                    int opp_idx = opponent_callback_(obs, mask);
+                    opp_idx = std::clamp(opp_idx, 0, static_cast<int>(opp_actions.size()) - 1);
+                    opp_action = opp_actions[opp_idx];
+                } else {
+                    std::uniform_int_distribution<int> dist(0, opp_actions.size() - 1);
+                    opp_action = opp_actions[dist(rng_)];
+                }
+                state_ = state_.apply_action(opp_action);
+            } else {
+                break;  // Hero's turn
+            }
+        }
+
+        bool done = state_.is_terminal();
+        float reward = done ? state_.utility(hero_player_) : 0.0f;
+
+        py::dict info;
+        info["pot"] = state_.pot();
+
+        return py::make_tuple(get_observation(), reward, done, info);
+    }
+
+    /**
+     * Get action mask (which actions are legal).
+     * Returns: numpy array of bools (num_actions,)
+     */
+    py::array_t<bool> get_action_mask() {
+        std::vector<bool> mask(num_actions_, false);
+
+        if (state_.is_terminal() || state_.is_chance_node()) {
+            mask[1] = true;  // Default to call/check
+            return py::array_t<bool>(mask.size(), mask.data());
+        }
+
+        std::vector<Action> legal = state_.get_legal_actions();
+
+        for (const auto& action : legal) {
+            int idx = action_to_index(action);
+            if (idx >= 0 && idx < num_actions_) {
+                mask[idx] = true;
+            }
+        }
+
+        // Ensure at least one action is valid
+        bool any_valid = false;
+        for (bool b : mask) any_valid |= b;
+        if (!any_valid) mask[1] = true;
+
+        return py::array_t<bool>(mask.size(), mask.data());
+    }
+
+    /**
+     * Get current observation.
+     * Returns: numpy array (38, 4, 13) matching AlphaHoldem encoding
+     */
+    py::array_t<float> get_observation() {
+        return get_observation_for_player(hero_player_);
+    }
+
+    /**
+     * Set opponent policy callback.
+     * Args:
+     *     callback: Function taking (obs, mask) -> action_idx
+     */
+    void set_opponent(py::function callback) {
+        opponent_callback_ = [callback](py::array_t<float> obs, py::array_t<bool> mask) -> int {
+            py::object result = callback(obs, mask);
+            return result.cast<int>();
+        };
+    }
+
+    /**
+     * Clear opponent callback (use random opponent).
+     */
+    void clear_opponent() {
+        opponent_callback_ = nullptr;
+    }
+
+    bool is_terminal() const { return state_.is_terminal(); }
+    float get_pot() const { return state_.pot(); }
+    int current_player() const { return state_.current_player(); }
+
+private:
+    HoldemState state_;
+    float stack_size_;
+    int num_actions_;
+    int hero_player_;
+    float cumulative_reward_;
+    std::mt19937 rng_;
+    std::function<int(py::array_t<float>, py::array_t<bool>)> opponent_callback_;
+
+    py::array_t<float> get_observation_for_player(int player) {
+        // Create 38x4x13 observation tensor
+        std::vector<float> obs(38 * 4 * 13, 0.0f);
+
+        // Encode hole cards (planes 0-1)
+        const auto& hand = state_.hand(player);
+        for (int i = 0; i < 2; ++i) {
+            Card c = hand[i];
+            if (c != NO_CARD) {
+                int rank = card_rank(c);
+                int suit = card_suit(c);
+                obs[i * 52 + suit * 13 + rank] = 1.0f;
+            }
+        }
+
+        // Encode board (planes 2-6)
+        for (int i = 0; i < 5; ++i) {
+            Card c = state_.board_card(i);
+            if (c != NO_CARD) {
+                int rank = card_rank(c);
+                int suit = card_suit(c);
+                obs[(2 + i) * 52 + suit * 13 + rank] = 1.0f;
+            }
+        }
+
+        // Encode game state (planes 7+)
+        float pot_norm = state_.pot() / (2 * stack_size_);
+        float hero_stack_norm = state_.stack(player) / stack_size_;
+        float villain_stack_norm = state_.stack(1 - player) / stack_size_;
+
+        // Fill state planes
+        for (int i = 0; i < 52; ++i) {
+            obs[7 * 52 + i] = pot_norm;
+            obs[8 * 52 + i] = hero_stack_norm;
+            obs[9 * 52 + i] = villain_stack_norm;
+        }
+
+        // Street encoding (planes 10-13)
+        int street_idx = static_cast<int>(state_.street());
+        for (int i = 0; i < 52; ++i) {
+            obs[(10 + street_idx) * 52 + i] = 1.0f;
+        }
+
+        return py::array_t<float>({38, 4, 13}, obs.data());
+    }
+
+    py::array_t<bool> get_action_mask_for_player(int player) {
+        // Simplified - same logic as get_action_mask but for any player
+        (void)player;  // Currently same for both players
+        return get_action_mask();
+    }
+
+    int action_to_index(const Action& action) {
+        switch (action.type) {
+            case ActionType::Fold: return 0;
+            case ActionType::Check: return 1;
+            case ActionType::Call: return 1;
+            case ActionType::Bet:
+            case ActionType::Raise:
+            case ActionType::AllIn: {
+                // Map bet sizes to indices 2-13
+                float pot = std::max(state_.pot(), 1.0f);
+                float ratio = action.amount / pot;
+                if (ratio < 0.4f) return 2;
+                if (ratio < 0.6f) return 3;
+                if (ratio < 0.8f) return 4;
+                if (ratio < 1.0f) return 5;
+                if (ratio < 1.5f) return 6;
+                if (ratio < 2.0f) return 7;
+                if (ratio < 3.0f) return 8;
+                if (action.type == ActionType::AllIn) return 13;
+                return std::min(9 + static_cast<int>(ratio), 12);
+            }
+            default: return 1;
+        }
+    }
+};
+
+
 PYBIND11_MODULE(ares_solver, m) {
-    m.doc() = "ARES-HU Poker Solver - Fast CFR implementation";
+    m.doc() = "ARES-HU Poker Solver - Fast CFR implementation + RL Environment";
 
     py::class_<AresSolver>(m, "Solver")
         .def(py::init<>())
@@ -615,5 +879,33 @@ PYBIND11_MODULE(ares_solver, m) {
         .def("has_neural_model", &AresSolver::has_neural_model,
              "Check if neural model is loaded")
 #endif
+        ;
+
+    // Fast RL Environment for training
+    py::class_<FastPokerEnv>(m, "FastEnv")
+        .def(py::init<float, int>(),
+             py::arg("stack_size") = 100.0f,
+             py::arg("num_actions") = 14,
+             "Create fast poker environment for RL training")
+        .def("reset", &FastPokerEnv::reset,
+             "Reset environment, returns observation")
+        .def("step", &FastPokerEnv::step,
+             py::arg("action"),
+             "Step with action, returns (obs, reward, done, info)")
+        .def("get_action_mask", &FastPokerEnv::get_action_mask,
+             "Get valid action mask")
+        .def("get_observation", &FastPokerEnv::get_observation,
+             "Get current observation")
+        .def("set_opponent", &FastPokerEnv::set_opponent,
+             py::arg("callback"),
+             "Set opponent policy function(obs, mask) -> action")
+        .def("clear_opponent", &FastPokerEnv::clear_opponent,
+             "Clear opponent (use random)")
+        .def("is_terminal", &FastPokerEnv::is_terminal,
+             "Check if game is over")
+        .def("get_pot", &FastPokerEnv::get_pot,
+             "Get current pot size")
+        .def("current_player", &FastPokerEnv::current_player,
+             "Get current player index")
         ;
 }
