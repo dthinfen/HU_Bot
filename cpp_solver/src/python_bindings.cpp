@@ -591,7 +591,10 @@ public:
             state_ = state_.deal_random(rng_);
         }
 
-        hero_player_ = 0;  // Hero is always player 0 (button)
+        // CRITICAL FIX: Alternate hero position between BTN (0) and BB (1)
+        // This ensures model learns both in-position and out-of-position play
+        hero_player_ = hand_count_ % 2;
+        hand_count_++;
         cumulative_reward_ = 0.0f;
 
         return get_observation();
@@ -834,51 +837,159 @@ private:
     int num_actions_;
     int hero_player_;
     float cumulative_reward_;
+    int hand_count_ = 0;  // For alternating positions
     std::mt19937 rng_;
     std::function<int(py::array_t<float>, py::array_t<bool>)> opponent_callback_;
 
     py::array_t<float> get_observation_for_player(int player) {
-        // Create 38x4x13 observation tensor
-        std::vector<float> obs(38 * 4 * 13, 0.0f);
+        // Create 38x4x13 observation tensor matching Python AlphaHoldemEncoder exactly
+        // Layout: C x H x W where C=38 channels, H=4 suits, W=13 ranks
+        constexpr int H = 4;   // suits
+        constexpr int W = 13;  // ranks
+        constexpr int PLANE_SIZE = H * W;  // 52
 
-        // Encode hole cards (planes 0-1)
+        std::vector<float> obs(38 * PLANE_SIZE, 0.0f);
+
+        // Helper to set a value at (channel, suit, rank)
+        auto set_obs = [&](int channel, int suit, int rank, float value) {
+            obs[channel * PLANE_SIZE + suit * W + rank] = value;
+        };
+
+        // Helper to fill entire plane with a value
+        auto fill_plane = [&](int channel, float value) {
+            for (int i = 0; i < PLANE_SIZE; ++i) {
+                obs[channel * PLANE_SIZE + i] = value;
+            }
+        };
+
+        // Collect all visible cards for suit/rank counting
+        std::vector<std::pair<int, int>> all_cards;  // (rank, suit)
+
+        // [0-1] Hole cards (2 channels, one per card)
         const auto& hand = state_.hand(player);
         for (int i = 0; i < 2; ++i) {
             Card c = hand[i];
             if (c != NO_CARD) {
                 int rank = get_rank_int(c);
                 int suit = get_suit_int(c);
-                obs[i * 52 + suit * 13 + rank] = 1.0f;
+                set_obs(i, suit, rank, 1.0f);
+                all_cards.push_back({rank, suit});
             }
         }
 
-        // Encode board (planes 2-6)
+        // [2-6] Board cards (5 channels, one per card position)
         const auto& board = state_.board();
         for (int i = 0; i < state_.board_count(); ++i) {
             Card c = board[i];
             if (c != NO_CARD) {
                 int rank = get_rank_int(c);
                 int suit = get_suit_int(c);
-                obs[(2 + i) * 52 + suit * 13 + rank] = 1.0f;
+                set_obs(2 + i, suit, rank, 1.0f);
+                all_cards.push_back({rank, suit});
             }
         }
 
-        // Encode game state (planes 7+)
-        float pot_norm = state_.pot() / (2 * stack_size_);
-        float hero_stack_norm = state_.stack(player) / stack_size_;
-        float villain_stack_norm = state_.stack(1 - player) / stack_size_;
-
-        // Fill state planes
-        for (int i = 0; i < 52; ++i) {
-            obs[7 * 52 + i] = pot_norm;
-            obs[8 * 52 + i] = hero_stack_norm;
-            obs[9 * 52 + i] = villain_stack_norm;
+        // [7] All known cards combined
+        for (const auto& [rank, suit] : all_cards) {
+            set_obs(7, suit, rank, 1.0f);
         }
 
-        // Street encoding (planes 10-13)
+        // [8-11] Suit counts (how many of each suit visible, normalized by 7)
+        int suit_counts[4] = {0, 0, 0, 0};
+        for (const auto& [rank, suit] : all_cards) {
+            suit_counts[suit]++;
+        }
+        for (int s = 0; s < 4; ++s) {
+            fill_plane(8 + s, suit_counts[s] / 7.0f);
+        }
+
+        // [12-15] Rank counts (pairs, trips, quads detection)
+        int rank_counts[13] = {0};
+        for (const auto& [rank, suit] : all_cards) {
+            rank_counts[rank]++;
+        }
+        for (int r = 0; r < 13; ++r) {
+            int count = rank_counts[r];
+            if (count >= 1) {
+                for (int s = 0; s < 4; ++s) set_obs(12, s, r, 1.0f);  // Has at least one
+            }
+            if (count >= 2) {
+                for (int s = 0; s < 4; ++s) set_obs(13, s, r, 1.0f);  // Has pair
+            }
+            if (count >= 3) {
+                for (int s = 0; s < 4; ++s) set_obs(14, s, r, 1.0f);  // Has trips
+            }
+            if (count >= 4) {
+                for (int s = 0; s < 4; ++s) set_obs(15, s, r, 1.0f);  // Has quads
+            }
+        }
+
+        // [16-19] Street indicators (one-hot)
         int street_idx = static_cast<int>(state_.street());
-        for (int i = 0; i < 52; ++i) {
-            obs[(10 + street_idx) * 52 + i] = 1.0f;
+        fill_plane(16 + street_idx, 1.0f);
+
+        // [20-23] Position indicators
+        // In HU: player 0 = button (IP postflop), player 1 = BB (OOP postflop)
+        bool is_button = (player == 0);
+        if (is_button) {
+            fill_plane(20, 1.0f);  // Hero is button
+        } else {
+            fill_plane(21, 1.0f);  // Hero is big blind
+        }
+        // Planes 22-23 reserved for future use
+
+        // [24-27] Pot/stack ratios
+        float total_chips = state_.pot() + state_.stack(0) + state_.stack(1);
+        if (total_chips > 0) {
+            fill_plane(24, state_.pot() / total_chips);
+        }
+        fill_plane(25, state_.stack(player) / stack_size_);
+        fill_plane(26, state_.stack(1 - player) / stack_size_);
+        // Plane 27: total invested normalized
+        float hero_invested = stack_size_ - state_.stack(player);
+        float villain_invested = stack_size_ - state_.stack(1 - player);
+        fill_plane(27, (hero_invested + villain_invested) / (2 * stack_size_));
+
+        // [28-37] Betting history (last 10 actions)
+        // Encodes action type, amount, and who acted
+        const auto& history = state_.action_history();
+        int history_size = static_cast<int>(history.size());
+        int start_idx = std::max(0, history_size - 10);
+
+        for (int i = start_idx; i < history_size; ++i) {
+            int channel = 28 + (i - start_idx);
+            const Action& action = history[i];
+
+            // Action type encoding (row 0, spread across columns 0-5)
+            // 0=fold, 1=check, 2=call, 3=bet, 4=raise, 5=all-in
+            int action_type = 0;
+            switch (action.type) {
+                case ActionType::Fold:  action_type = 0; break;
+                case ActionType::Check: action_type = 1; break;
+                case ActionType::Call:  action_type = 2; break;
+                case ActionType::Bet:   action_type = 3; break;
+                case ActionType::Raise: action_type = 4; break;
+                case ActionType::AllIn: action_type = 5; break;
+                default: action_type = 1; break;
+            }
+            if (action_type < W) {
+                set_obs(channel, 0, action_type, 1.0f);
+            }
+
+            // Amount encoding (row 1, normalized by starting stack)
+            float norm_amount = std::min(action.amount / stack_size_, 1.0f);
+            for (int r = 0; r < W; ++r) {
+                set_obs(channel, 1, r, norm_amount);
+            }
+
+            // Hero/villain indicator (row 2)
+            // Determine who made this action based on action index parity
+            // In HU, actions alternate between players
+            // The first action in history is from the player who acts first
+            bool is_hero_action = ((i % 2) == (player % 2));
+            for (int r = 0; r < W; ++r) {
+                set_obs(channel, 2, r, is_hero_action ? 1.0f : 0.0f);
+            }
         }
 
         return py::array_t<float>({38, 4, 13}, obs.data());
