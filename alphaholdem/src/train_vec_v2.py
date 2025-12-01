@@ -127,7 +127,7 @@ class KBestPool:
         agent_info = self.agents[idx]
 
         opponent = model_class(
-            input_channels=38,
+            input_channels=50,
             use_cnn=True,
             num_actions=num_actions,
             fc_hidden_dim=self.fc_hidden_dim,
@@ -142,7 +142,7 @@ class KBestPool:
             return None
         agent_info = self.agents[idx]
         model = model_class(
-            input_channels=38,
+            input_channels=50,
             use_cnn=True,
             num_actions=num_actions,
             fc_hidden_dim=self.fc_hidden_dim,
@@ -171,7 +171,7 @@ class VectorizedTrainerV2:
 
         # Model
         self.model = ActorCritic(
-            input_channels=38,
+            input_channels=50,
             use_cnn=config.use_cnn,
             hidden_dim=config.hidden_dim,
             num_actions=config.num_actions,
@@ -216,7 +216,7 @@ class VectorizedTrainerV2:
         self.buffer = VectorizedRolloutBuffer(
             config.steps_per_env,
             config.num_envs,
-            (38, 4, 13),
+            (50, 4, 13),
             config.num_actions,
             self.device
         )
@@ -277,7 +277,7 @@ class VectorizedTrainerV2:
                     # End warmup, save warmup model for self-play
                     print(f"  [WARMUP] Completed warmup phase, switching to self-play")
                     self.warmup_model = ActorCritic(
-                        input_channels=38, use_cnn=True, num_actions=self.config.num_actions,
+                        input_channels=50, use_cnn=True, num_actions=self.config.num_actions,
                         fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
                     ).to(self.device)
                     self.warmup_model.load_state_dict(self.model.state_dict())

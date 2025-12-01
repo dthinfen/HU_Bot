@@ -394,14 +394,14 @@ if __name__ == "__main__":
     # Test PPO
     print("Testing PPO:")
 
-    model = ActorCritic(input_channels=38, use_cnn=True, num_actions=8)
+    model = ActorCritic(input_channels=50, use_cnn=True, num_actions=8)
     ppo = PPO(model, device='cpu')
 
     # Create dummy buffer
-    buffer = RolloutBuffer(1000, (38, 4, 13))
+    buffer = RolloutBuffer(1000, (50, 4, 13))
 
     for i in range(100):
-        obs = np.random.randn(38, 4, 13).astype(np.float32)
+        obs = np.random.randn(50, 4, 13).astype(np.float32)
         action = np.random.randint(0, 8)
         log_prob = np.random.randn()
         value = np.random.randn()
@@ -419,7 +419,7 @@ if __name__ == "__main__":
     print(f"  KL: {stats['kl']:.4f}")
 
     # Test action selection
-    obs = np.random.randn(38, 4, 13).astype(np.float32)
+    obs = np.random.randn(50, 4, 13).astype(np.float32)
     mask = np.ones(8)
     action, log_prob, value = ppo.get_action(obs, mask)
     print(f"  Action: {action}, Log prob: {log_prob:.4f}, Value: {value:.4f}")

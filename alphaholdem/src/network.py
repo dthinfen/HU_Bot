@@ -44,7 +44,7 @@ class CNNBackbone(nn.Module):
 
     def __init__(
         self,
-        input_channels: int = 38,
+        input_channels: int = 50,
         hidden_channels: int = 128,
         num_residual_blocks: int = 4,
         output_dim: int = 256
@@ -202,7 +202,7 @@ class ActorCritic(nn.Module):
 
     def __init__(
         self,
-        input_channels: int = 38,
+        input_channels: int = 50,
         use_cnn: bool = True,
         hidden_dim: int = 256,  # Backbone output dim
         num_actions: int = 8,
@@ -330,7 +330,7 @@ class PseudoSiameseNetwork(nn.Module):
 
     def __init__(
         self,
-        input_channels: int = 38,
+        input_channels: int = 50,
         hidden_dim: int = 256,
         num_actions: int = 8,
         num_residual_blocks: int = 4
@@ -387,8 +387,8 @@ if __name__ == "__main__":
 
     # Test CNN backbone
     print("Testing CNN Actor-Critic:")
-    model = ActorCritic(input_channels=38, use_cnn=True, num_actions=num_actions)
-    x = torch.randn(batch_size, 38, 4, 13)
+    model = ActorCritic(input_channels=50, use_cnn=True, num_actions=num_actions)
+    x = torch.randn(batch_size, 50, 4, 13)
     mask = torch.ones(batch_size, num_actions, dtype=torch.bool)
     mask[:, 0] = False  # Mask out fold
 

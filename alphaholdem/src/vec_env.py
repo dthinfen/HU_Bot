@@ -53,7 +53,7 @@ class VectorizedHeadsUpEnv:
         Reset all environments.
 
         Returns:
-            observations: (num_envs, 38, 4, 13) tensor
+            observations: (num_envs, 50, 4, 13) tensor
             action_masks: (num_envs, num_actions) boolean array
         """
         observations = []
@@ -78,7 +78,7 @@ class VectorizedHeadsUpEnv:
         Reset only environments that are done.
 
         Returns:
-            observations: (num_envs, 38, 4, 13)
+            observations: (num_envs, 50, 4, 13)
             action_masks: (num_envs, num_actions)
             reset_mask: (num_envs,) boolean - which envs were reset
         """
@@ -123,7 +123,7 @@ class VectorizedHeadsUpEnv:
             actions: (num_envs,) array of actions
 
         Returns:
-            observations: (num_envs, 38, 4, 13)
+            observations: (num_envs, 50, 4, 13)
             action_masks: (num_envs, num_actions)
             rewards: (num_envs,)
             dones: (num_envs,)

@@ -48,12 +48,15 @@ class AlphaHoldemEncoder:
     [8-11]  : Suit counts (how many of each suit visible)
     [12-15] : Rank counts (pairs, trips, etc.)
     [16-19] : Street indicators (one-hot for preflop/flop/turn/river)
-    [20-23] : Position indicators
+    [20-21] : Position indicators (BTN/BB)
+    [22]    : To-call amount (normalized by pot)
+    [23]    : Facing all-in indicator
     [24-27] : Pot/stack ratios
-    [28-37] : Betting history (last 10 actions encoded)
+    [28-49] : Betting history (last 22 actions encoded)
     """
 
-    NUM_CHANNELS = 38
+    NUM_CHANNELS = 50
+    MAX_HISTORY = 22
     HEIGHT = 4   # Suits
     WIDTH = 13   # Ranks
 
@@ -122,11 +125,20 @@ class AlphaHoldemEncoder:
         # Street indicators (channels 16-19)
         tensor[16 + street, :, :] = 1.0
 
-        # Position (channels 20-23)
+        # Position (channels 20-21)
         if is_button:
             tensor[20, :, :] = 1.0  # Hero is button
         else:
             tensor[21, :, :] = 1.0  # Hero is big blind
+
+        # To-call amount (channel 22) - compute from investments
+        to_call = max(0, villain_invested - hero_invested)
+        pot_for_odds = max(pot, 1.0)
+        tensor[22, :, :] = min(to_call / pot_for_odds, 2.0) / 2.0  # Normalized
+
+        # Facing all-in indicator (channel 23)
+        facing_allin = (villain_stack < 0.01 and to_call > 0)
+        tensor[23, :, :] = 1.0 if facing_allin else 0.0
 
         # Pot/stack info (channels 24-27)
         total_chips = pot + hero_stack + villain_stack
@@ -136,9 +148,8 @@ class AlphaHoldemEncoder:
             tensor[26, :, :] = villain_stack / starting_stack
             tensor[27, :, :] = (hero_invested + villain_invested) / (2 * starting_stack)
 
-        # Betting history (channels 28-37)
-        # Encode last 10 actions
-        for i, (action_type, amount) in enumerate(action_history[-10:]):
+        # Betting history (channels 28-49) - last 22 actions
+        for i, (action_type, amount) in enumerate(action_history[-self.MAX_HISTORY:]):
             channel = 28 + i
             # Action type encoding (spread across width)
             # 0=fold, 1=check, 2=call, 3=bet, 4=raise, 5=all-in

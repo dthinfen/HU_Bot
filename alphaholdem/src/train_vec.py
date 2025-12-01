@@ -118,7 +118,7 @@ class KBestPool:
 
         agent_info = random.choice(self.agents)
         opponent = model_class(
-            input_channels=38,
+            input_channels=50,
             use_cnn=True,
             num_actions=num_actions,
             fc_hidden_dim=self.fc_hidden_dim,
@@ -133,7 +133,7 @@ class KBestPool:
             return None
         agent_info = self.agents[idx]
         model = model_class(
-            input_channels=38,
+            input_channels=50,
             use_cnn=True,
             num_actions=num_actions,
             fc_hidden_dim=self.fc_hidden_dim,
@@ -162,7 +162,7 @@ class VectorizedTrainer:
 
         # Model
         self.model = ActorCritic(
-            input_channels=38,
+            input_channels=50,
             use_cnn=config.use_cnn,
             hidden_dim=config.hidden_dim,
             num_actions=config.num_actions,
@@ -207,7 +207,7 @@ class VectorizedTrainer:
         self.buffer = VectorizedRolloutBuffer(
             config.steps_per_env,
             config.num_envs,
-            (38, 4, 13),
+            (50, 4, 13),
             config.num_actions,
             self.device
         )

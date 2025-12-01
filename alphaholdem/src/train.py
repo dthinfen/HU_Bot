@@ -156,7 +156,7 @@ class KBestPool:
 
         agent_info = self.agents[idx]
         model = model_class(
-            input_channels=38,
+            input_channels=50,
             use_cnn=True,
             num_actions=num_actions,
             fc_hidden_dim=self.fc_hidden_dim,
@@ -173,7 +173,7 @@ class KBestPool:
 
         agent_info = random.choice(self.agents)
         opponent = model_class(
-            input_channels=38,
+            input_channels=50,
             use_cnn=True,
             num_actions=num_actions,
             fc_hidden_dim=self.fc_hidden_dim,
@@ -190,7 +190,7 @@ class KBestPool:
 
         best = max(self.agents, key=lambda x: x['elo'])
         opponent = model_class(
-            input_channels=38,
+            input_channels=50,
             use_cnn=True,
             num_actions=num_actions,
             fc_hidden_dim=self.fc_hidden_dim,
@@ -225,7 +225,7 @@ class SelfPlayTrainer:
 
         # Initialize model (AlphaHoldem paper: 8.6M params)
         self.model = ActorCritic(
-            input_channels=38,
+            input_channels=50,
             use_cnn=config.use_cnn,
             hidden_dim=config.hidden_dim,
             num_actions=config.num_actions,
@@ -263,7 +263,7 @@ class SelfPlayTrainer:
         # Rollout buffer
         self.buffer = RolloutBuffer(
             config.steps_per_update,
-            (38, 4, 13),
+            (50, 4, 13),
             self.device
         )
 

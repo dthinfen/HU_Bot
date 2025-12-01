@@ -842,13 +842,29 @@ private:
     std::function<int(py::array_t<float>, py::array_t<bool>)> opponent_callback_;
 
     py::array_t<float> get_observation_for_player(int player) {
-        // Create 38x4x13 observation tensor matching Python AlphaHoldemEncoder exactly
-        // Layout: C x H x W where C=38 channels, H=4 suits, W=13 ranks
+        // Create 50x4x13 observation tensor matching Python AlphaHoldemEncoder exactly
+        // Layout: C x H x W where C=50 channels, H=4 suits, W=13 ranks
+        //
+        // Channel layout:
+        // [0-1]:   Hole cards (2)
+        // [2-6]:   Board cards (5)
+        // [7]:     All known cards combined (1)
+        // [8-11]:  Suit counts (4)
+        // [12-15]: Rank counts (4)
+        // [16-19]: Street indicators (4)
+        // [20-21]: Position indicators (2)
+        // [22]:    To-call amount normalized (1)
+        // [23]:    Facing all-in indicator (1)
+        // [24-27]: Pot/stack ratios (4)
+        // [28-49]: Betting history - 22 actions (22)
+        // Total: 50 channels
+
+        constexpr int NUM_CHANNELS = 50;
         constexpr int H = 4;   // suits
         constexpr int W = 13;  // ranks
         constexpr int PLANE_SIZE = H * W;  // 52
 
-        std::vector<float> obs(38 * PLANE_SIZE, 0.0f);
+        std::vector<float> obs(NUM_CHANNELS * PLANE_SIZE, 0.0f);
 
         // Helper to set a value at (channel, suit, rank)
         auto set_obs = [&](int channel, int suit, int rank, float value) {
@@ -928,7 +944,7 @@ private:
         int street_idx = static_cast<int>(state_.street());
         fill_plane(16 + street_idx, 1.0f);
 
-        // [20-23] Position indicators
+        // [20-21] Position indicators
         // In HU: player 0 = button (IP postflop), player 1 = BB (OOP postflop)
         bool is_button = (player == 0);
         if (is_button) {
@@ -936,7 +952,17 @@ private:
         } else {
             fill_plane(21, 1.0f);  // Hero is big blind
         }
-        // Planes 22-23 reserved for future use
+
+        // [22] To-call amount (normalized by pot for pot odds)
+        float to_call_amt = state_.to_call();
+        float pot = std::max(state_.pot(), 1.0f);
+        fill_plane(22, std::min(to_call_amt / pot, 2.0f) / 2.0f);  // Cap at 2x pot, normalize to 0-1
+
+        // [23] Facing all-in indicator
+        // Check if opponent is all-in (their stack is 0 and we have a decision)
+        int opp = 1 - player;
+        bool facing_allin = (state_.stack(opp) < 0.01f && to_call_amt > 0);
+        fill_plane(23, facing_allin ? 1.0f : 0.0f);
 
         // [24-27] Pot/stack ratios
         float total_chips = state_.pot() + state_.stack(0) + state_.stack(1);
@@ -950,11 +976,12 @@ private:
         float villain_invested = stack_size_ - state_.stack(1 - player);
         fill_plane(27, (hero_invested + villain_invested) / (2 * stack_size_));
 
-        // [28-37] Betting history (last 10 actions)
+        // [28-49] Betting history (last 22 actions - enough for any HU hand)
         // Encodes action type, amount, and who acted
+        constexpr int MAX_HISTORY = 22;
         const auto& history = state_.action_history();
         int history_size = static_cast<int>(history.size());
-        int start_idx = std::max(0, history_size - 10);
+        int start_idx = std::max(0, history_size - MAX_HISTORY);
 
         for (int i = start_idx; i < history_size; ++i) {
             int channel = 28 + (i - start_idx);
@@ -992,7 +1019,7 @@ private:
             }
         }
 
-        return py::array_t<float>({38, 4, 13}, obs.data());
+        return py::array_t<float>({NUM_CHANNELS, H, W}, obs.data());
     }
 
     py::array_t<bool> get_action_mask_for_player(int player) {
