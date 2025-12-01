@@ -272,7 +272,8 @@ std::vector<Action> HoldemState::get_legal_actions() const {
 
 HoldemState HoldemState::apply_action(const Action& action) const {
     HoldemState new_state = *this;
-    new_state.history_.push_back(action);
+    // Store action with player info for history encoding
+    new_state.history_.push_back(action.with_player(current_player_));
 
     int player = current_player_;
     int opp = 1 - player;

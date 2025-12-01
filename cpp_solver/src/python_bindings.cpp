@@ -1010,10 +1010,8 @@ private:
             }
 
             // Hero/villain indicator (row 2)
-            // Determine who made this action based on action index parity
-            // In HU, actions alternate between players
-            // The first action in history is from the player who acts first
-            bool is_hero_action = ((i % 2) == (player % 2));
+            // Use the player field from the action (properly tracks who acted)
+            bool is_hero_action = (action.player == player);
             for (int r = 0; r < W; ++r) {
                 set_obs(channel, 2, r, is_hero_action ? 1.0f : 0.0f);
             }

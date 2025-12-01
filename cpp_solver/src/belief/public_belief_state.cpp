@@ -168,7 +168,7 @@ PublicBeliefState PublicBeliefState::apply_action(
     const std::vector<std::vector<float>>& action_probs
 ) const {
     PublicBeliefState next = *this;
-    next.history_.push_back(action);
+    next.history_.push_back(action.with_player(current_player_));
 
     int player = current_player_;
     int opp = 1 - player;

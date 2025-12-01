@@ -20,17 +20,25 @@ enum class ActionType : uint8_t {
 struct Action {
     ActionType type;
     float amount;  // In big blinds
+    int8_t player; // Which player made this action (0 or 1), -1 if unknown
 
     // Default constructor
-    Action() : type(ActionType::Fold), amount(0.0f) {}
+    Action() : type(ActionType::Fold), amount(0.0f), player(-1) {}
 
     // Explicit constructors for each type
-    static Action fold() { return {ActionType::Fold, 0.0f}; }
-    static Action check() { return {ActionType::Check, 0.0f}; }
-    static Action call() { return {ActionType::Call, 0.0f}; }
-    static Action bet(float amt) { return {ActionType::Bet, amt}; }
-    static Action raise_to(float amt) { return {ActionType::Raise, amt}; }
-    static Action all_in(float amt) { return {ActionType::AllIn, amt}; }
+    static Action fold() { return {ActionType::Fold, 0.0f, -1}; }
+    static Action check() { return {ActionType::Check, 0.0f, -1}; }
+    static Action call() { return {ActionType::Call, 0.0f, -1}; }
+    static Action bet(float amt) { return {ActionType::Bet, amt, -1}; }
+    static Action raise_to(float amt) { return {ActionType::Raise, amt, -1}; }
+    static Action all_in(float amt) { return {ActionType::AllIn, amt, -1}; }
+
+    // Set player for this action
+    Action with_player(int p) const {
+        Action a = *this;
+        a.player = static_cast<int8_t>(p);
+        return a;
+    }
 
     bool operator==(const Action& other) const {
         if (type != other.type) return false;
@@ -72,7 +80,7 @@ struct Action {
     }
 
 private:
-    Action(ActionType t, float a) : type(t), amount(a) {}
+    Action(ActionType t, float a, int8_t p) : type(t), amount(a), player(p) {}
 };
 
 // Street representation
