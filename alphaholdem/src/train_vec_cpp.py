@@ -48,14 +48,15 @@ class TrainConfig:
     total_timesteps: int = 100_000_000
 
     # Self-play
-    k_best: int = 5
+    k_best: int = 10  # Larger pool for more diversity
     update_opponent_every: int = 5
     eval_for_pool_every: int = 25
     min_updates_for_pool: int = 100
     warmup_self_play_updates: int = 50
-    elo_games_per_matchup: int = 200
+    elo_games_per_matchup: int = 10000  # More hands = lower variance (poker is high variance)
+    eval_num_envs: int = 256  # Parallel envs for fast evaluation
     initial_elo: float = 1500.0
-    elo_k_factor: float = 16.0
+    elo_k_factor: float = 32.0  # Standard chess K-factor (applied per matchup, not per game)
 
     # Network
     hidden_dim: int = 256
@@ -70,7 +71,7 @@ class TrainConfig:
     eval_games: int = 500
 
     # Memory management
-    gc_every: int = 10
+    gc_every: int = 50  # Less frequent GC for less overhead
 
     # Paths
     checkpoint_dir: str = "alphaholdem/checkpoints"
@@ -173,8 +174,8 @@ class CppVectorizedEnv:
 
         # BATCHED neural network inference with FP16 (fast!)
         with torch.no_grad():
-            obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=self.opponent_device)
-            mask_tensor = torch.tensor(mask_batch, dtype=torch.bool, device=self.opponent_device)
+            obs_tensor = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.opponent_device)
+            mask_tensor = torch.as_tensor(mask_batch, dtype=torch.bool, device=self.opponent_device)
 
             # Use mixed precision for faster inference (doesn't affect accuracy)
             with torch.amp.autocast(device_type='cuda', enabled=self.use_amp):
@@ -182,9 +183,8 @@ class CppVectorizedEnv:
 
             probs = torch.softmax(logits.float(), dim=-1)
 
-            # Stochastic with exploration
-            noise = 0.05 / self.num_actions
-            probs = probs * 0.95 + noise
+            # Stochastic with exploration (vectorized)
+            probs = probs * 0.95 + 0.05 / self.num_actions
             probs = probs / probs.sum(dim=-1, keepdim=True)
 
             # Sample actions for all at once
@@ -343,6 +343,131 @@ class VectorizedRolloutBuffer:
         self.full = False
 
 
+class VectorizedEvaluator:
+    """Fast vectorized evaluation for ELO calculation."""
+
+    def __init__(self, num_envs: int, starting_stack: float, num_actions: int, device: str):
+        self.num_envs = num_envs
+        self.starting_stack = starting_stack
+        self.num_actions = num_actions
+        self.device = device
+
+        # Create C++ environments
+        self.envs = [ares_solver.FastEnv(starting_stack, num_actions) for _ in range(num_envs)]
+        self.dones = np.zeros(num_envs, dtype=bool)
+
+    def evaluate_matchup(self, hero_model: ActorCritic, opponent_model: ActorCritic,
+                         num_games: int, use_amp: bool = False) -> float:
+        """Play num_games between hero and opponent, return total profit for hero."""
+        total_profit = 0.0
+        games_completed = 0
+
+        hero_model.eval()
+        opponent_model.eval()
+
+        # Reset all environments
+        for env in self.envs:
+            env.reset()
+        self.dones[:] = False
+
+        while games_completed < num_games:
+            # Reset done environments
+            active_indices = []
+            for i, env in enumerate(self.envs):
+                if self.dones[i] or env.is_terminal():
+                    env.reset()
+                    self.dones[i] = False
+                active_indices.append(i)
+
+            if not active_indices:
+                break
+
+            # Collect hero observations
+            hero_obs_list = []
+            hero_mask_list = []
+            needs_hero = []
+
+            for i in active_indices:
+                if not self.envs[i].is_terminal() and not self.envs[i].needs_opponent_action():
+                    hero_obs_list.append(self.envs[i].get_observation())
+                    hero_mask_list.append(self.envs[i].get_action_mask())
+                    needs_hero.append(i)
+
+            # Batched hero inference
+            if needs_hero:
+                hero_actions = self._batched_inference(
+                    hero_model, hero_obs_list, hero_mask_list, use_amp
+                )
+
+                # Apply hero actions
+                for idx, i in enumerate(needs_hero):
+                    if games_completed >= num_games:
+                        break
+                    obs, reward, done, needs_opp = self.envs[i].step_hero_only(hero_actions[idx])
+                    if done:
+                        total_profit += reward
+                        games_completed += 1
+                        self.dones[i] = True
+
+            # Handle opponent actions
+            needs_opponent = []
+            for i in active_indices:
+                if not self.dones[i] and not self.envs[i].is_terminal() and self.envs[i].needs_opponent_action():
+                    needs_opponent.append(i)
+
+            while needs_opponent and games_completed < num_games:
+                opp_obs_list = []
+                opp_mask_list = []
+                for i in needs_opponent:
+                    opp_obs_list.append(self.envs[i].get_opponent_observation())
+                    opp_mask_list.append(self.envs[i].get_opponent_action_mask())
+
+                opp_actions = self._batched_inference(
+                    opponent_model, opp_obs_list, opp_mask_list, use_amp
+                )
+
+                next_needs_opponent = []
+                for idx, i in enumerate(needs_opponent):
+                    if games_completed >= num_games:
+                        break
+                    done, reward = self.envs[i].apply_opponent_action(opp_actions[idx])
+                    if done:
+                        total_profit += reward
+                        games_completed += 1
+                        self.dones[i] = True
+                    elif self.envs[i].needs_opponent_action():
+                        next_needs_opponent.append(i)
+
+                needs_opponent = next_needs_opponent
+
+        return total_profit
+
+    def _batched_inference(self, model: ActorCritic, obs_list: list, mask_list: list,
+                           use_amp: bool) -> list:
+        """Batched neural network inference."""
+        if not obs_list:
+            return []
+
+        obs_batch = np.stack(obs_list)
+        mask_batch = np.stack(mask_list)
+
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(obs_batch, dtype=torch.float32, device=self.device)
+            mask_tensor = torch.as_tensor(mask_batch, dtype=torch.bool, device=self.device)
+
+            with torch.amp.autocast(device_type='cuda', enabled=use_amp and self.device != 'cpu'):
+                logits, _ = model(obs_tensor, mask_tensor)
+
+            probs = torch.softmax(logits.float(), dim=-1)
+            # Small exploration noise for evaluation stability
+            probs = probs * 0.98 + 0.02 / self.num_actions
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+
+            actions = torch.multinomial(probs, 1).squeeze(-1).cpu().numpy()
+
+        return actions.tolist()
+
+
 class KBestPool:
     """Pool of K-best agents."""
 
@@ -438,14 +563,22 @@ class CppTrainer:
             fc_num_layers=config.fc_num_layers
         ).to(self.device)
 
+        # Compile model for faster training (PyTorch 2.0+)
+        if hasattr(torch, 'compile') and self.device == 'cuda':
+            try:
+                self.model = torch.compile(self.model, mode='reduce-overhead')
+                print("Model compiled with torch.compile for faster training")
+            except Exception as e:
+                print(f"torch.compile not available: {e}")
+
         # PPO - AlphaHoldem paper settings
         ppo_config = PPOConfig(
-            learning_rate=1e-4,
+            learning_rate=3e-4,  # Paper: 0.0003
             clip_ratio=3.0,      # Paper: δ1=3 for Trinal-Clip (NOT 0.2)
             gamma=0.999,         # Paper: 0.999 discount factor
             gae_lambda=0.95,     # Paper: λ=0.95
             num_epochs=4,        # Paper: 4 epochs
-            minibatch_size=256,
+            minibatch_size=256,  # Keep original for consistent training dynamics
             batch_size=config.steps_per_update
         )
         self.ppo = PPO(self.model, ppo_config, self.device)
@@ -465,8 +598,10 @@ class CppTrainer:
             config.num_envs, config.starting_stack, config.num_actions
         )
 
-        # Single env for evaluation
-        self.eval_env = ares_solver.FastEnv(config.starting_stack, config.num_actions)
+        # Vectorized evaluation for fast ELO calculation
+        self.evaluator = VectorizedEvaluator(
+            config.eval_num_envs, config.starting_stack, config.num_actions, self.device
+        )
 
         # Buffer
         self.buffer = VectorizedRolloutBuffer(
@@ -574,8 +709,9 @@ class CppTrainer:
             obs, action_masks, _ = self.vec_env.reset_done_envs()
 
             with torch.no_grad():
-                obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
-                mask_tensor = torch.tensor(action_masks, dtype=torch.bool, device=self.device)
+                # Use as_tensor + non_blocking for faster CPU->GPU transfer
+                obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+                mask_tensor = torch.as_tensor(action_masks, dtype=torch.bool, device=self.device)
 
                 # FP16 inference for speed (doesn't affect model accuracy)
                 with torch.amp.autocast(device_type='cuda', enabled=self.use_amp):
@@ -583,13 +719,13 @@ class CppTrainer:
 
                 probs = torch.softmax(logits.float(), dim=-1)
 
-                # Exploration noise
+                # Exploration noise (vectorized)
                 probs = probs * 0.99 + 0.01 / self.config.num_actions
                 probs = probs / probs.sum(dim=-1, keepdim=True)
 
-                dist = torch.distributions.Categorical(probs)
-                actions = dist.sample()
-                log_probs = dist.log_prob(actions)
+                # Sample actions directly without creating distribution object (faster)
+                actions = torch.multinomial(probs, 1).squeeze(-1)
+                log_probs = torch.log(probs.gather(1, actions.unsqueeze(-1)).squeeze(-1) + 1e-8)
 
                 actions_np = actions.cpu().numpy()
                 log_probs_np = log_probs.cpu().numpy()
@@ -628,12 +764,7 @@ class CppTrainer:
         num_updates = 0
 
         # Trinal-Clip hyperparameters (from paper)
-        delta1 = self.ppo.config.clip_ratio  # 3.0 (upper bound)
-        # δ2 and δ3 are dynamic based on chips, but we approximate with fixed values
-        # Paper says range is 0 to 20000 based on chips played
-        # We use conservative fixed bounds for stability
-        delta2 = 0.5   # Lower bound for negative advantage clipping
-        delta3 = 1.5   # Upper bound for negative advantage clipping
+        delta1 = self.ppo.config.clip_ratio  # 3.0 (upper bound for positive advantages)
 
         for epoch in range(self.ppo.config.num_epochs):
             for batch in self.buffer.get_batches(self.ppo.config.minibatch_size):
@@ -651,10 +782,23 @@ class CppTrainer:
 
                 # Trinal-Clip Policy Loss
                 # For positive advantages: clip(ratio, 1-ε, δ1) where δ1=3
-                # For negative advantages: clip(ratio, δ2, δ3) for stability on bad hands
+                # For negative advantages: DYNAMIC clip based on pot size (return magnitude)
 
                 # Standard PPO term
                 surr1 = ratio * advantages
+
+                # Dynamic δ2, δ3 based on return magnitude (proxy for pot size/stakes)
+                # High stakes (large |return|) = tighter clipping for stability
+                # Low stakes (small |return|) = looser clipping for faster learning
+                #
+                # IMPORTANT: Must ensure delta2 < delta3 always!
+                # pot_scale: 0 = small pot, 1 = large pot (clamped)
+                pot_scale = (torch.abs(returns) / self.config.starting_stack).clamp(0, 1)
+                # Low pot: [0.5, 1.5] (loose), High pot: [0.7, 1.3] (tight)
+                delta2 = 0.5 + 0.2 * pot_scale  # Range: 0.5 to 0.7
+                delta3 = 1.5 - 0.2 * pot_scale  # Range: 1.5 to 1.3
+                # Verify: at pot_scale=0: [0.5, 1.5], at pot_scale=1: [0.7, 1.3]
+                # delta2 < delta3 always (0.7 < 1.3) ✓
 
                 # Trinal-Clip: different clipping for positive vs negative advantages
                 pos_adv_mask = (advantages >= 0).float()
@@ -663,8 +807,9 @@ class CppTrainer:
                 # Positive advantages: use upper clip δ1=3 (allow ratio up to 3x)
                 clipped_ratio_pos = torch.clamp(ratio, 1.0 - 0.2, delta1)
 
-                # Negative advantages: use tighter clip [δ2, δ3] for stability
-                clipped_ratio_neg = torch.clamp(ratio, delta2, delta3)
+                # Negative advantages: use DYNAMIC tighter clip [δ2, δ3] for stability
+                # Per-sample clipping based on pot size
+                clipped_ratio_neg = torch.max(torch.min(ratio, delta3), delta2)
 
                 clipped_ratio = pos_adv_mask * clipped_ratio_pos + neg_adv_mask * clipped_ratio_neg
                 surr2 = clipped_ratio * advantages
@@ -701,42 +846,6 @@ class CppTrainer:
             'entropy': total_entropy / max(num_updates, 1),
         }
 
-    def _make_opponent_policy(self):
-        """Create opponent policy function for C++ env.
-
-        Optimized for speed:
-        - Pre-allocated tensors to avoid allocation overhead
-        - Model stays on GPU
-        - Minimal Python overhead
-        """
-        # Pre-allocate tensors once (avoid allocation per call)
-        obs_buffer = torch.zeros(1, 38, 4, 13, dtype=torch.float32, device=self.device)
-        mask_buffer = torch.zeros(1, self.config.num_actions, dtype=torch.bool, device=self.device)
-        noise = 0.05 / self.config.num_actions
-
-        def policy(obs, mask):
-            if self.opponent is None:
-                valid = np.where(mask)[0]
-                return int(np.random.choice(valid)) if len(valid) > 0 else 1
-
-            # Copy data into pre-allocated buffers (faster than creating new tensors)
-            obs_buffer[0] = torch.from_numpy(obs).to(self.device)
-            mask_buffer[0] = torch.from_numpy(mask).to(self.device)
-
-            with torch.no_grad():
-                logits, _ = self.opponent(obs_buffer, mask_buffer)
-                probs = torch.softmax(logits, dim=-1)
-
-                # Stochastic with exploration
-                probs = probs * 0.95 + noise
-                probs = probs / probs.sum()
-
-                # Sample action
-                action = torch.multinomial(probs, 1).item()
-                return action
-
-        return policy
-
     def _update_opponent(self):
         if len(self.opponent_pool.agents) == 0:
             if self.warmup_model is not None:
@@ -745,33 +854,20 @@ class CppTrainer:
                 self._current_opp_id = -1  # No pool agent
                 self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
         else:
-            # FIXED: 30% chance to play against current self for diversity
-            if np.random.random() < 0.3:
-                # Play against current model (fresh copy)
-                if self._current_opp_id != self.update_count:
-                    self.opponent = ActorCritic(
-                        input_channels=38, use_cnn=self.config.use_cnn, num_actions=self.config.num_actions,
-                        fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
-                    ).to(self.device)
-                    self.opponent.load_state_dict(self.model.state_dict())
+            # Sample uniformly from pool (K-best already provides diversity)
+            # Note: Removed self-play against current model - it produces ~50/50 outcomes
+            # which provides no useful learning signal. Diversity comes from the K-best pool.
+            opponent, agent_info = self.opponent_pool.sample_opponent(ActorCritic, self.config.num_actions)
+            if opponent is not None:
+                new_opp_id = agent_info['update_num']
+                # Only print when actually switching to different agent
+                if new_opp_id != self._current_opp_id:
+                    self.opponent = opponent.to(self.device)
                     self.opponent.eval()
-                    self._current_opp_elo = self.opponent_pool.get_average_elo()
-                    self._current_opp_id = self.update_count
+                    self._current_opp_elo = agent_info['elo']
+                    self._current_opp_id = new_opp_id
                     self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
-                    print(f"  [OPPONENT] Playing against SELF (update {self.update_count})")
-            else:
-                # Play against pool agent
-                opponent, agent_info = self.opponent_pool.sample_opponent(ActorCritic, self.config.num_actions)
-                if opponent is not None:
-                    new_opp_id = agent_info['update_num']
-                    # FIXED: Only print when actually switching to different agent
-                    if new_opp_id != self._current_opp_id:
-                        self.opponent = opponent.to(self.device)
-                        self.opponent.eval()
-                        self._current_opp_elo = agent_info['elo']
-                        self._current_opp_id = new_opp_id
-                        self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
-                        print(f"  [OPPONENT] Switched to agent_{new_opp_id} (ELO={agent_info['elo']:.0f})")
+                    print(f"  [OPPONENT] Switched to agent_{new_opp_id} (ELO={agent_info['elo']:.0f})")
 
     def _evaluate_for_pool(self):
         if len(self.opponent_pool.agents) == 0:
@@ -784,15 +880,18 @@ class CppTrainer:
             print(f"  [POOL] {self.opponent_pool.get_pool_stats()}")
 
     def _evaluate_against_pool(self):
+        """Vectorized evaluation against all pool agents for ELO calculation."""
         if len(self.opponent_pool.agents) == 0:
-            return self.config.initial_elo, 0.5, []
+            return self.config.initial_elo, 0.0, []
 
-        # FIXED: Start at pool average ELO, not 1500
+        # Start at pool average ELO
         new_elo = self.opponent_pool.get_average_elo()
         total_profit = 0.0
         total_games = 0
         results = []
         self.model.eval()
+
+        games_per_matchup = self.config.elo_games_per_matchup
 
         for idx, agent_info in enumerate(self.opponent_pool.agents):
             opponent = self.opponent_pool.get_agent_by_idx(idx, ActorCritic, self.config.num_actions)
@@ -802,56 +901,31 @@ class CppTrainer:
             opponent = opponent.to(self.device)
             opponent.eval()
 
-            old_opponent = self.opponent
-            self.opponent = opponent
+            # Use vectorized evaluation for speed
+            matchup_profit = self.evaluator.evaluate_matchup(
+                self.model, opponent, games_per_matchup, use_amp=self.use_amp
+            )
 
-            matchup_profit = 0.0
-            games = self.config.elo_games_per_matchup
-
-            for _ in range(games):
-                self.eval_env.reset()
-                self.eval_env.set_opponent(self._make_opponent_policy())
-
-                done = False
-                game_reward = 0
-
-                while not done:
-                    if self.eval_env.is_terminal():
-                        break
-                    obs = self.eval_env.get_observation()
-                    mask = self.eval_env.get_action_mask()
-
-                    with torch.no_grad():
-                        obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-                        mask_t = torch.tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
-                        logits, _ = self.model(obs_t, mask_t)
-                        probs = torch.softmax(logits, dim=-1)
-                        dist = torch.distributions.Categorical(probs)
-                        action = dist.sample()
-
-                    _, reward, done, _ = self.eval_env.step(action.item())
-                    game_reward += reward
-
-                # FIXED: Track total profit, not just wins/losses
-                matchup_profit += game_reward
-
-            self.opponent = old_opponent
             total_profit += matchup_profit
-            total_games += games
+            total_games += games_per_matchup
 
-            # FIXED: Use profit-based score instead of win rate
-            # Convert bb profit to 0-1 score: +10bb/hand → 1.0, -10bb/hand → 0.0, 0 → 0.5
-            bb_per_hand = matchup_profit / games
-            score = 0.5 + (bb_per_hand / 20.0)  # ±10bb/hand maps to 0-1
+            # Convert profit to 0-1 score for ELO calculation
+            # Use wider range (±25 bb/hand) to avoid clamping during early training
+            bb_per_hand = matchup_profit / games_per_matchup
+            score = 0.5 + (bb_per_hand / 50.0)  # ±25bb/hand maps to 0-1
             score = max(0.0, min(1.0, score))  # Clamp to [0, 1]
 
             opponent_elo = agent_info['elo']
             expected = 1 / (1 + 10 ** ((opponent_elo - new_elo) / 400))
-            new_elo += self.config.elo_k_factor * games * (score - expected)
+            # K-factor per matchup (not per game) - standard ELO formula
+            new_elo += self.config.elo_k_factor * (score - expected)
 
             results.append({
                 'opponent': agent_info['update_num'],
-                'profit': matchup_profit, 'bb_per_hand': bb_per_hand, 'score': score
+                'opponent_elo': opponent_elo,
+                'profit': matchup_profit,
+                'bb_per_hand': bb_per_hand,
+                'score': score
             })
 
         self.model.train()
