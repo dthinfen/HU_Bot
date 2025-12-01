@@ -43,8 +43,8 @@ def get_raw_state_dict(model):
 @dataclass
 class TrainConfig:
     """Training configuration."""
-    starting_stack: float = 100.0  # Default/max stack
-    min_stack: float = 10.0  # Minimum stack for variation
+    starting_stack: float = 200.0  # Default/max stack (Slumbot uses 200bb)
+    min_stack: float = 50.0  # Minimum stack for variation
     vary_stacks: bool = True  # Whether to vary stack sizes
     num_actions: int = 14
 
@@ -106,10 +106,10 @@ class CppVectorizedEnv:
         self.vary_stacks = vary_stacks
         self.min_stack = min_stack
 
-        # Stack sizes to use (common tournament/cash game depths)
-        # Distribution weighted towards medium stacks where most play happens
+        # Stack sizes to use (cash game depths, Slumbot plays 200bb)
+        # Focus on 50-200bb range where most cash game play happens
         if vary_stacks:
-            self.stack_sizes = [10, 15, 20, 25, 30, 40, 50, 75, 100]
+            self.stack_sizes = [50, 75, 100, 125, 150, 175, 200]
             self.stack_sizes = [s for s in self.stack_sizes if min_stack <= s <= starting_stack]
             if not self.stack_sizes:
                 self.stack_sizes = [starting_stack]
@@ -387,7 +387,7 @@ class VectorizedEvaluator:
 
         # Stack sizes to use for evaluation (same as training for fair eval)
         if vary_stacks:
-            stack_sizes = [10, 15, 20, 25, 30, 40, 50, 75, 100]
+            stack_sizes = [50, 75, 100, 125, 150, 175, 200]
             stack_sizes = [s for s in stack_sizes if min_stack <= s <= starting_stack]
             if not stack_sizes:
                 stack_sizes = [starting_stack]
@@ -1053,8 +1053,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train AlphaHoldem with C++ acceleration")
     parser.add_argument('--timesteps', type=int, default=100_000_000)
     parser.add_argument('--num-envs', type=int, default=256)
-    parser.add_argument('--stack', type=float, default=100.0, help="Max starting stack (bb)")
-    parser.add_argument('--min-stack', type=float, default=10.0, help="Min starting stack (bb)")
+    parser.add_argument('--stack', type=float, default=200.0, help="Max starting stack (bb)")
+    parser.add_argument('--min-stack', type=float, default=50.0, help="Min starting stack (bb)")
     parser.add_argument('--no-vary-stacks', action='store_true', help="Disable stack size variation")
     parser.add_argument('--device', type=str, default='auto')
     parser.add_argument('--checkpoint-dir', type=str, default='alphaholdem/checkpoints')
