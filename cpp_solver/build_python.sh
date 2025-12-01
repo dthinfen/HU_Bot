@@ -1,5 +1,6 @@
 #!/bin/bash
 # Build script for ARES-HU pybind11 Python module
+# Works on macOS and Linux (RunPod)
 
 set -e
 
@@ -9,23 +10,38 @@ SRC_DIR="$SCRIPT_DIR/src"
 INCLUDE_DIR="$SCRIPT_DIR/include"
 BUILD_DIR="$SCRIPT_DIR/build"
 
-# Use miniforge3 Python (has pybind11 installed)
-PYTHON="${PYTHON:-/Users/daniel/miniforge3/bin/python3}"
+# Find Python - use PYTHON env var, or detect automatically
+if [[ -n "$PYTHON" ]]; then
+    echo "Using PYTHON from environment: $PYTHON"
+elif [[ -f "/Users/daniel/miniforge3/bin/python3" ]]; then
+    PYTHON="/Users/daniel/miniforge3/bin/python3"  # macOS dev machine
+else
+    PYTHON="$(which python3)"  # Linux/RunPod
+fi
+
+echo "Using Python: $PYTHON"
+
+# Check pybind11 is installed
+if ! $PYTHON -c "import pybind11" 2>/dev/null; then
+    echo "Installing pybind11..."
+    pip install pybind11
+fi
 
 # Get pybind11 includes and extension suffix
 PYBIND_INCLUDES=$($PYTHON -m pybind11 --includes)
 EXTENSION_SUFFIX=$($PYTHON -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
 
-# LibTorch setup
-TORCH_DIR="/Users/daniel/miniforge3/lib/python3.12/site-packages/torch"
-USE_LIBTORCH=1
+# LibTorch setup - auto-detect
+TORCH_DIR=$($PYTHON -c "import torch; print(torch.__path__[0])" 2>/dev/null || echo "")
+USE_LIBTORCH="${USE_LIBTORCH:-0}"  # Disabled by default for portability
 
 # Compiler settings
 CXX="${CXX:-g++}"
 CXXFLAGS="-std=c++17 -O3 -Wall -Wextra -shared -fPIC -I$INCLUDE_DIR $PYBIND_INCLUDES"
 
-# Add LibTorch if available
-if [[ "$USE_LIBTORCH" == "1" && -d "$TORCH_DIR" ]]; then
+# Add LibTorch if available and enabled
+LDFLAGS=""
+if [[ "$USE_LIBTORCH" == "1" && -n "$TORCH_DIR" && -d "$TORCH_DIR" ]]; then
     CXXFLAGS="$CXXFLAGS -DARES_USE_LIBTORCH"
     CXXFLAGS="$CXXFLAGS -I$TORCH_DIR/include"
     CXXFLAGS="$CXXFLAGS -I$TORCH_DIR/include/torch/csrc/api/include"
@@ -36,8 +52,7 @@ if [[ "$USE_LIBTORCH" == "1" && -d "$TORCH_DIR" ]]; then
     fi
     echo "LibTorch enabled: $TORCH_DIR"
 else
-    LDFLAGS=""
-    echo "LibTorch disabled"
+    echo "LibTorch disabled (USE_LIBTORCH=$USE_LIBTORCH)"
 fi
 
 # macOS-specific flags
@@ -58,7 +73,7 @@ CORE_SOURCES=(
 )
 
 # Add neural evaluator if LibTorch is enabled
-if [[ "$USE_LIBTORCH" == "1" && -d "$TORCH_DIR" ]]; then
+if [[ "$USE_LIBTORCH" == "1" && -n "$TORCH_DIR" && -d "$TORCH_DIR" ]]; then
     CORE_SOURCES+=("$SRC_DIR/neural/neural_evaluator.cpp")
 fi
 
