@@ -357,7 +357,7 @@ class KBestPool:
         self.fc_num_layers = fc_num_layers
         self.agents: List[Dict] = []
 
-    def add_agent(self, model: ActorCritic, elo: float, update_num: int, win_rate: float = 0.5):
+    def add_agent(self, model: ActorCritic, elo: float, update_num: int, bb_per_100: float = 0.0):
         path = self.checkpoint_dir / f"agent_{update_num}.pt"
         torch.save(model.state_dict(), path)
 
@@ -365,7 +365,7 @@ class KBestPool:
             'path': str(path),
             'elo': elo,
             'update_num': update_num,
-            'win_rate': win_rate
+            'bb_per_100': bb_per_100  # Changed from win_rate to bb/100
         })
 
         self.agents.sort(key=lambda x: x['elo'], reverse=True)
@@ -379,11 +379,9 @@ class KBestPool:
         if not self.agents:
             return None, None
 
-        elos = np.array([a['elo'] for a in self.agents])
-        weights = np.exp((elos - elos.min()) / 100)
-        weights /= weights.sum()
-
-        idx = np.random.choice(len(self.agents), p=weights)
+        # FIXED: Use uniform sampling for diversity (not ELO-weighted)
+        # High ELO weighting caused overfitting to one opponent
+        idx = np.random.randint(len(self.agents))
         agent_info = self.agents[idx]
 
         opponent = model_class(
@@ -393,6 +391,12 @@ class KBestPool:
         opponent.load_state_dict(torch.load(agent_info['path'], map_location='cpu'))
         opponent.eval()
         return opponent, agent_info
+
+    def get_average_elo(self) -> float:
+        """Get average ELO of pool for new agent initialization."""
+        if not self.agents:
+            return self.initial_elo
+        return np.mean([a['elo'] for a in self.agents])
 
     def get_agent_by_idx(self, idx: int, model_class: type, num_actions: int = 14):
         if idx >= len(self.agents):
@@ -477,6 +481,7 @@ class CppTrainer:
         self.episode_rewards: deque = deque(maxlen=5000)
         self.opponent: Optional[ActorCritic] = None
         self._current_opp_elo = None
+        self._current_opp_id = -1  # Track current opponent for diversity
 
         # Speed tracking (instantaneous)
         self._last_update_time = None
@@ -737,33 +742,54 @@ class CppTrainer:
             if self.warmup_model is not None:
                 self.opponent = self.warmup_model
                 self._current_opp_elo = self.config.initial_elo
+                self._current_opp_id = -1  # No pool agent
                 self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
         else:
-            opponent, agent_info = self.opponent_pool.sample_opponent(ActorCritic, self.config.num_actions)
-            if opponent is not None:
-                self.opponent = opponent.to(self.device)
-                self.opponent.eval()
-                self._current_opp_elo = agent_info['elo']
-                # Use BATCHED opponent inference with FP16 (fast!)
-                self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
-                print(f"  [OPPONENT] Switched to agent_{agent_info['update_num']} (ELO={agent_info['elo']:.0f})")
+            # FIXED: 30% chance to play against current self for diversity
+            if np.random.random() < 0.3:
+                # Play against current model (fresh copy)
+                if self._current_opp_id != self.update_count:
+                    self.opponent = ActorCritic(
+                        input_channels=38, use_cnn=self.config.use_cnn, num_actions=self.config.num_actions,
+                        fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
+                    ).to(self.device)
+                    self.opponent.load_state_dict(self.model.state_dict())
+                    self.opponent.eval()
+                    self._current_opp_elo = self.opponent_pool.get_average_elo()
+                    self._current_opp_id = self.update_count
+                    self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
+                    print(f"  [OPPONENT] Playing against SELF (update {self.update_count})")
+            else:
+                # Play against pool agent
+                opponent, agent_info = self.opponent_pool.sample_opponent(ActorCritic, self.config.num_actions)
+                if opponent is not None:
+                    new_opp_id = agent_info['update_num']
+                    # FIXED: Only print when actually switching to different agent
+                    if new_opp_id != self._current_opp_id:
+                        self.opponent = opponent.to(self.device)
+                        self.opponent.eval()
+                        self._current_opp_elo = agent_info['elo']
+                        self._current_opp_id = new_opp_id
+                        self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
+                        print(f"  [OPPONENT] Switched to agent_{new_opp_id} (ELO={agent_info['elo']:.0f})")
 
     def _evaluate_for_pool(self):
         if len(self.opponent_pool.agents) == 0:
             self.opponent_pool.add_agent(self.model, self.config.initial_elo, self.update_count)
             print(f"  [POOL] Added first agent_{self.update_count}")
         else:
-            new_elo, win_rate, _ = self._evaluate_against_pool()
-            self.opponent_pool.add_agent(self.model, new_elo, self.update_count, win_rate)
-            print(f"  [POOL] Agent_{self.update_count}: ELO={new_elo:.0f}, win_rate={win_rate:.1%}")
+            new_elo, bb_per_100, _ = self._evaluate_against_pool()
+            self.opponent_pool.add_agent(self.model, new_elo, self.update_count, bb_per_100)
+            print(f"  [POOL] Agent_{self.update_count}: ELO={new_elo:.0f}, bb/100={bb_per_100:+.1f}")
             print(f"  [POOL] {self.opponent_pool.get_pool_stats()}")
 
     def _evaluate_against_pool(self):
         if len(self.opponent_pool.agents) == 0:
             return self.config.initial_elo, 0.5, []
 
-        new_elo = self.config.initial_elo
-        total_wins = 0
+        # FIXED: Start at pool average ELO, not 1500
+        new_elo = self.opponent_pool.get_average_elo()
+        total_profit = 0.0
         total_games = 0
         results = []
         self.model.eval()
@@ -779,7 +805,7 @@ class CppTrainer:
             old_opponent = self.opponent
             self.opponent = opponent
 
-            wins, losses, draws = 0, 0, 0
+            matchup_profit = 0.0
             games = self.config.elo_games_per_matchup
 
             for _ in range(games):
@@ -806,30 +832,32 @@ class CppTrainer:
                     _, reward, done, _ = self.eval_env.step(action.item())
                     game_reward += reward
 
-                if game_reward > 0.5:
-                    wins += 1
-                elif game_reward < -0.5:
-                    losses += 1
-                else:
-                    draws += 1
+                # FIXED: Track total profit, not just wins/losses
+                matchup_profit += game_reward
 
             self.opponent = old_opponent
-            total_wins += wins
+            total_profit += matchup_profit
             total_games += games
 
+            # FIXED: Use profit-based score instead of win rate
+            # Convert bb profit to 0-1 score: +10bb/hand → 1.0, -10bb/hand → 0.0, 0 → 0.5
+            bb_per_hand = matchup_profit / games
+            score = 0.5 + (bb_per_hand / 20.0)  # ±10bb/hand maps to 0-1
+            score = max(0.0, min(1.0, score))  # Clamp to [0, 1]
+
             opponent_elo = agent_info['elo']
-            score = (wins + 0.5 * draws) / games
             expected = 1 / (1 + 10 ** ((opponent_elo - new_elo) / 400))
             new_elo += self.config.elo_k_factor * games * (score - expected)
 
             results.append({
                 'opponent': agent_info['update_num'],
-                'wins': wins, 'draws': draws, 'losses': losses, 'score': score
+                'profit': matchup_profit, 'bb_per_hand': bb_per_hand, 'score': score
             })
 
         self.model.train()
-        win_rate = total_wins / total_games if total_games > 0 else 0.5
-        return new_elo, win_rate, results
+        # Return bb/100 as the metric (more meaningful than win rate)
+        bb_per_100 = (total_profit / total_games * 100) if total_games > 0 else 0.0
+        return new_elo, bb_per_100, results
 
     def _save_checkpoint(self, final: bool = False):
         suffix = "final" if final else f"{self.update_count}"
