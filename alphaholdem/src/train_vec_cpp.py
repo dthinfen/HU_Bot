@@ -81,7 +81,7 @@ class TrainConfig:
 
 
 class CppVectorizedEnv:
-    """Vectorized environment using C++ FastEnv instances."""
+    """Vectorized environment using C++ FastEnv instances with BATCHED opponent inference."""
 
     def __init__(self, num_envs: int, starting_stack: float, num_actions: int):
         self.num_envs = num_envs
@@ -92,13 +92,18 @@ class CppVectorizedEnv:
         self.envs = [ares_solver.FastEnv(starting_stack, num_actions) for _ in range(num_envs)]
         self.dones = np.zeros(num_envs, dtype=bool)
 
-    def set_opponent(self, policy_fn):
-        """Set opponent policy for all environments."""
-        for env in self.envs:
-            if policy_fn is not None:
-                env.set_opponent(policy_fn)
-            else:
-                env.clear_opponent()
+        # Opponent model for batched inference (set by trainer)
+        self.opponent_model = None
+        self.opponent_device = 'cpu'
+
+    def set_opponent_model(self, model, device):
+        """Set opponent model for BATCHED inference (fast!)."""
+        self.opponent_model = model
+        self.opponent_device = device
+
+    def clear_opponent(self):
+        """Clear opponent (random actions)."""
+        self.opponent_model = None
 
     def reset(self):
         """Reset all environments."""
@@ -138,36 +143,106 @@ class CppVectorizedEnv:
 
         return np.array(observations), np.array(action_masks), reset_mask
 
+    def _batched_opponent_inference(self, indices):
+        """Do BATCHED inference for all opponents that need to act."""
+        if not indices:
+            return {}
+
+        # Collect observations and masks
+        obs_list = []
+        mask_list = []
+        for i in indices:
+            obs_list.append(self.envs[i].get_opponent_observation())
+            mask_list.append(self.envs[i].get_opponent_action_mask())
+
+        obs_batch = np.stack(obs_list)
+        mask_batch = np.stack(mask_list)
+
+        if self.opponent_model is None:
+            # Random actions
+            actions = {}
+            for idx, i in enumerate(indices):
+                valid = np.where(mask_batch[idx])[0]
+                actions[i] = int(np.random.choice(valid)) if len(valid) > 0 else 1
+            return actions
+
+        # BATCHED neural network inference (fast!)
+        with torch.no_grad():
+            obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=self.opponent_device)
+            mask_tensor = torch.tensor(mask_batch, dtype=torch.bool, device=self.opponent_device)
+
+            logits, _ = self.opponent_model(obs_tensor, mask_tensor)
+            probs = torch.softmax(logits, dim=-1)
+
+            # Stochastic with exploration
+            noise = 0.05 / self.num_actions
+            probs = probs * 0.95 + noise
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+
+            # Sample actions for all at once
+            action_indices = torch.multinomial(probs, 1).squeeze(-1).cpu().numpy()
+
+        return {i: int(action_indices[idx]) for idx, i in enumerate(indices)}
+
     def step(self, actions: np.ndarray):
-        """Step all environments."""
+        """Step all environments with BATCHED opponent inference."""
         observations = []
         action_masks = []
         rewards = np.zeros(self.num_envs, dtype=np.float32)
         dones = np.zeros(self.num_envs, dtype=bool)
         infos = []
 
+        # Phase 1: Apply hero actions
+        needs_opponent = []
         for i, (env, action) in enumerate(zip(self.envs, actions)):
             if self.dones[i]:
-                obs = env.get_observation()
-                mask = env.get_action_mask()
-                observations.append(obs)
-                action_masks.append(mask)
+                observations.append(env.get_observation())
+                action_masks.append(env.get_action_mask())
                 infos.append({})
                 continue
 
-            obs, reward, done, info = env.step(int(action))
+            # Use step_hero_only to not trigger per-env callback
+            obs, reward, done, needs_opp = env.step_hero_only(int(action))
 
             rewards[i] = reward
             dones[i] = done
             self.dones[i] = done
+            observations.append(obs)
+            infos.append({'pot': env.get_pot()})
+
+            if needs_opp and not done:
+                needs_opponent.append(i)
 
             mask = env.get_action_mask()
             if not mask.any():
                 mask[1] = True
-
-            observations.append(obs)
             action_masks.append(mask)
-            infos.append(info)
+
+        # Phase 2: BATCHED opponent inference (one forward pass for ALL opponents)
+        while needs_opponent:
+            opponent_actions = self._batched_opponent_inference(needs_opponent)
+
+            # Apply opponent actions and check if more actions needed
+            next_needs_opponent = []
+            for i in needs_opponent:
+                done, reward = self.envs[i].apply_opponent_action(opponent_actions[i])
+
+                if done:
+                    rewards[i] = reward
+                    dones[i] = True
+                    self.dones[i] = True
+                elif self.envs[i].needs_opponent_action():
+                    # Opponent acts again (e.g., after check-raise)
+                    next_needs_opponent.append(i)
+
+                # Update observation and mask
+                observations[i] = self.envs[i].get_observation()
+                mask = self.envs[i].get_action_mask()
+                if not mask.any():
+                    mask[1] = True
+                action_masks[i] = mask
+
+            needs_opponent = next_needs_opponent
 
         return np.array(observations), np.array(action_masks), rewards, dones, infos
 
@@ -445,7 +520,8 @@ class CppTrainer:
                     self.warmup_model.load_state_dict(self.model.state_dict())
                     self.warmup_model.eval()
                     self.opponent = self.warmup_model
-                    self.vec_env.set_opponent(self._make_opponent_policy())
+                    # Use BATCHED opponent inference (fast!)
+                    self.vec_env.set_opponent_model(self.opponent, self.device)
                     self.in_warmup = False
                     self._current_opp_elo = self.config.initial_elo
 
@@ -647,13 +723,15 @@ class CppTrainer:
             if self.warmup_model is not None:
                 self.opponent = self.warmup_model
                 self._current_opp_elo = self.config.initial_elo
+                self.vec_env.set_opponent_model(self.opponent, self.device)
         else:
             opponent, agent_info = self.opponent_pool.sample_opponent(ActorCritic, self.config.num_actions)
             if opponent is not None:
                 self.opponent = opponent.to(self.device)
                 self.opponent.eval()
                 self._current_opp_elo = agent_info['elo']
-                self.vec_env.set_opponent(self._make_opponent_policy())
+                # Use BATCHED opponent inference (fast!)
+                self.vec_env.set_opponent_model(self.opponent, self.device)
                 print(f"  [OPPONENT] Switched to agent_{agent_info['update_num']} (ELO={agent_info['elo']:.0f})")
 
     def _evaluate_for_pool(self):

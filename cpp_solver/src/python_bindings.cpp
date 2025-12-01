@@ -735,6 +735,99 @@ public:
     float get_pot() const { return state_.pot(); }
     int current_player() const { return state_.current_player(); }
 
+    /**
+     * Check if opponent needs to act (for batched inference).
+     * Returns true if it's opponent's turn (not hero's, not terminal, not chance).
+     */
+    bool needs_opponent_action() const {
+        if (state_.is_terminal() || state_.is_chance_node()) return false;
+        return state_.current_player() != hero_player_;
+    }
+
+    /**
+     * Get opponent observation for batched inference.
+     */
+    py::array_t<float> get_opponent_observation() {
+        return get_observation_for_player(1 - hero_player_);
+    }
+
+    /**
+     * Get opponent action mask for batched inference.
+     */
+    py::array_t<bool> get_opponent_action_mask() {
+        return get_action_mask_for_player(1 - hero_player_);
+    }
+
+    /**
+     * Apply opponent action (for batched inference - no callback).
+     * After this, handles chance nodes until it's hero's turn or terminal.
+     * Returns: (done, reward)
+     */
+    py::tuple apply_opponent_action(int action_idx) {
+        if (state_.is_terminal()) {
+            return py::make_tuple(true, state_.utility(hero_player_));
+        }
+
+        std::vector<Action> legal = state_.get_legal_actions();
+        if (legal.empty()) {
+            return py::make_tuple(true, 0.0f);
+        }
+
+        int clamped_idx = std::clamp(action_idx, 0, static_cast<int>(legal.size()) - 1);
+        state_ = state_.apply_action(legal[clamped_idx]);
+
+        // Handle chance nodes until hero's turn or terminal
+        while (!state_.is_terminal() && state_.is_chance_node()) {
+            state_ = state_.deal_random(rng_);
+        }
+
+        bool done = state_.is_terminal();
+        float reward = done ? state_.utility(hero_player_) : 0.0f;
+        return py::make_tuple(done, reward);
+    }
+
+    /**
+     * Step without auto-opponent (for batched inference).
+     * Only applies hero action, stops when opponent needs to act.
+     * Returns: (obs, reward, done, needs_opponent)
+     */
+    py::tuple step_hero_only(int action_idx) {
+        if (state_.is_terminal()) {
+            float reward = state_.utility(hero_player_);
+            return py::make_tuple(get_observation(), reward, true, false);
+        }
+
+        // Handle chance nodes first
+        while (state_.is_chance_node() && !state_.is_terminal()) {
+            state_ = state_.deal_random(rng_);
+        }
+
+        if (state_.is_terminal()) {
+            float reward = state_.utility(hero_player_);
+            return py::make_tuple(get_observation(), reward, true, false);
+        }
+
+        // Apply hero action
+        std::vector<Action> legal = state_.get_legal_actions();
+        if (legal.empty()) {
+            return py::make_tuple(get_observation(), 0.0f, true, false);
+        }
+
+        int clamped_idx = std::clamp(action_idx, 0, static_cast<int>(legal.size()) - 1);
+        state_ = state_.apply_action(legal[clamped_idx]);
+
+        // Handle chance nodes
+        while (!state_.is_terminal() && state_.is_chance_node()) {
+            state_ = state_.deal_random(rng_);
+        }
+
+        bool done = state_.is_terminal();
+        float reward = done ? state_.utility(hero_player_) : 0.0f;
+        bool needs_opp = !done && (state_.current_player() != hero_player_);
+
+        return py::make_tuple(get_observation(), reward, done, needs_opp);
+    }
+
 private:
     HoldemState state_;
     float stack_size_;
@@ -930,5 +1023,18 @@ PYBIND11_MODULE(ares_solver, m) {
              "Get current pot size")
         .def("current_player", &FastPokerEnv::current_player,
              "Get current player index")
+        // Batched inference methods
+        .def("needs_opponent_action", &FastPokerEnv::needs_opponent_action,
+             "Check if opponent needs to act (for batched inference)")
+        .def("get_opponent_observation", &FastPokerEnv::get_opponent_observation,
+             "Get opponent observation for batched inference")
+        .def("get_opponent_action_mask", &FastPokerEnv::get_opponent_action_mask,
+             "Get opponent action mask for batched inference")
+        .def("apply_opponent_action", &FastPokerEnv::apply_opponent_action,
+             py::arg("action"),
+             "Apply opponent action without callback, returns (done, reward)")
+        .def("step_hero_only", &FastPokerEnv::step_hero_only,
+             py::arg("action"),
+             "Step hero only, returns (obs, reward, done, needs_opponent)")
         ;
 }
