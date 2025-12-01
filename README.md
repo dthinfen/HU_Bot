@@ -2,7 +2,7 @@
 
 A high-performance poker AI using CFR (Counterfactual Regret Minimization) with real-time search and QRE (Quantal Response Equilibrium) targeting.
 
-## Current Status (Nov 2024)
+## Current Status (Dec 2024)
 
 ### What's Working
 - **DCFR+ Algorithm**: Same as ReBeL/Pluribus, with QRE for human exploitation
@@ -11,6 +11,15 @@ A high-performance poker AI using CFR (Counterfactual Regret Minimization) with 
 - **Neural Leaf Evaluation**: Value network integrated into C++ search via TorchScript
 - **Multi-stack Training**: Blueprints for 10bb, 20bb, 100bb, 200bb
 - **Slumbot Integration**: Can play hands against Slumbot (2018 ACPC Champion)
+- **AlphaHoldem-style RL**: Trinal-Clip PPO with K-Best self-play (~2500 steps/s on A40)
+
+### Recent Improvements (Dec 2024)
+- **ELO Calculation**: Now uses bb/100 profit instead of win rate (more accurate for poker)
+- **Dynamic Trinal-Clip**: δ2/δ3 scale based on pot size (larger pots = more clipping)
+- **Vectorized Evaluation**: 256 parallel envs, 10K hands per matchup for robust ELO
+- **TF32 Acceleration**: Enabled for Ampere+ GPUs (A40, A100) - ~10-20% speedup
+- **Uniform Pool Sampling**: Removed ELO-weighted sampling to prevent overfitting
+- **Speed Optimizations**: torch.compile, torch.as_tensor, reduced GC frequency
 
 ### Architecture vs State-of-the-Art
 
@@ -413,7 +422,7 @@ pip install torch numpy pybind11
 # 3. Build C++ Python bindings
 cd cpp_solver && ./build_python.sh && cd ..
 
-# 4. Start training (100M timesteps, ~7-9 hours on A40)
+# 4. Start training (100M timesteps, ~10-12 hours on A40)
 nohup python3 -m alphaholdem.src.train_vec_cpp --timesteps 100000000 > training_cpp.log 2>&1 &
 
 # 5. Monitor progress
@@ -426,18 +435,21 @@ python3 -m alphaholdem.src.train_vec_cpp --timesteps 100000000 --resume
 ```
 
 **Key Features:**
-- **Trinal-Clip PPO** (from AlphaHoldem paper): δ1=3, dynamic δ2/δ3
-- **K-Best Self-Play**: Trains against pool of best historical versions
-- **C++ FastEnv**: 3000-4000 steps/s with batched opponent inference
-- **FP16 Inference**: Mixed precision for speed (FP32 training)
-- **Stochastic Opponents**: Develops balanced frequencies
+- **Trinal-Clip PPO** (from AlphaHoldem paper): δ1=3, dynamic δ2/δ3 based on pot size
+- **K-Best Self-Play**: Trains against pool of 10 best historical versions
+- **C++ FastEnv**: ~2500 steps/s on A40 with batched opponent inference
+- **FP16 Inference + TF32**: Mixed precision for speed (FP32 training)
+- **ELO via bb/100**: Uses profit-based ELO (not win rate) for accurate ranking
+- **Vectorized Evaluation**: 256 parallel envs, 10K hands per matchup for low variance
 
 **Hyperparameters (Paper Settings):**
 - Discount factor: γ=0.999
 - GAE lambda: λ=0.95
 - PPO epochs: 4
+- Learning rate: 3e-4
 - 512 parallel environments
 - 8.1M parameter CNN
+- K-best pool size: 10
 
 ### CFR Solver (Alternative)
 

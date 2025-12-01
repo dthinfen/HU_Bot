@@ -1010,6 +1010,11 @@ def main():
     else:
         device = args.device
 
+    # Enable TF32 for faster matrix multiplication on Ampere+ GPUs (A40, A100, RTX 30xx/40xx)
+    # ~10-20% speedup with negligible precision loss for training
+    if device == 'cuda':
+        torch.set_float32_matmul_precision('high')
+
     config = TrainConfig(
         starting_stack=args.stack,
         total_timesteps=args.timesteps,
