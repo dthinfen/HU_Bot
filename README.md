@@ -14,12 +14,15 @@ A high-performance poker AI using CFR (Counterfactual Regret Minimization) with 
 - **AlphaHoldem-style RL**: Trinal-Clip PPO with K-Best self-play (~2500 steps/s on A40)
 
 ### Recent Improvements (Dec 2024)
+- **State Representation Overhaul**: 50-channel encoding with SPR, position, full betting history
+- **Street Markers in History**: Each action now tracks which street it occurred on
+- **SPR (Stack-to-Pot Ratio)**: Explicit encoding for commitment decisions
+- **Stack Size Variation**: Train across 10bb-100bb for robust play at all depths
+- **Hero/Villain Attribution**: Actions properly track who acted (not parity-based)
 - **ELO Calculation**: Now uses bb/100 profit instead of win rate (more accurate for poker)
 - **Dynamic Trinal-Clip**: δ2/δ3 scale based on pot size (larger pots = more clipping)
 - **Vectorized Evaluation**: 256 parallel envs, 10K hands per matchup for robust ELO
 - **TF32 Acceleration**: Enabled for Ampere+ GPUs (A40, A100) - ~10-20% speedup
-- **Uniform Pool Sampling**: Removed ELO-weighted sampling to prevent overfitting
-- **Speed Optimizations**: torch.compile, torch.as_tensor, reduced GC frequency
 
 ### Architecture vs State-of-the-Art
 
@@ -301,6 +304,22 @@ AlphaHoldem encodes game state as **3D tensors** containing:
 
 This tensor representation enables **convolutional networks** to learn spatial patterns in the game state.
 
+**Our Implementation (50 channels × 4 × 13):**
+| Channels | Feature | Purpose |
+|----------|---------|---------|
+| 0-6 | Hole cards + Board | Card information |
+| 7-15 | Combined cards, suit/rank counts | Pattern detection |
+| 16-21 | Street + Position indicators | Game context |
+| 22-23 | To-call, Facing all-in | Decision context |
+| 24-27 | Stacks, SPR, Pot fraction | Stack depth awareness |
+| 28-49 | 22 action history slots | Full betting sequence |
+
+Each action in history encodes:
+- Row 0: Action type (fold/check/call/bet/raise/allin)
+- Row 1: Amount (normalized)
+- Row 2: Hero/villain indicator
+- Row 3: Street indicator (preflop/flop/turn/river)
+
 #### Network Architecture
 - **Pseudo-Siamese architecture**: Two networks (current vs historical versions)
 - **ConvNet backbone**: Processes 3D tensor state representation
@@ -419,19 +438,32 @@ cd HU_Bot
 # 2. Install dependencies
 pip install torch numpy pybind11
 
-# 3. Build C++ Python bindings
-cd cpp_solver && ./build_python.sh && cd ..
+# 3. Build C++ Python bindings (no LibTorch needed for training)
+cd cpp_solver && USE_LIBTORCH=0 ./build_python.sh && cd ..
 
 # 4. Start training (100M timesteps, ~10-12 hours on A40)
-nohup python3 -m alphaholdem.src.train_vec_cpp --timesteps 100000000 > training_cpp.log 2>&1 &
+PYTHONPATH=/workspace/HU_Bot nohup python alphaholdem/src/train_vec_cpp.py \
+    --timesteps 100000000 \
+    --num-envs 512 \
+    > training.log 2>&1 &
 
 # 5. Monitor progress
-sleep 3 && tail -f training_cpp.log
+tail -f training.log
 ```
 
-**Resume from checkpoint:**
+**Training Options:**
 ```bash
-python3 -m alphaholdem.src.train_vec_cpp --timesteps 100000000 --resume
+# Train at 100bb only (faster, good for deep-stack)
+PYTHONPATH=/workspace/HU_Bot python alphaholdem/src/train_vec_cpp.py \
+    --no-vary-stacks --stack 100 --timesteps 100000000
+
+# Train across all stack depths (10bb-100bb, more robust)
+PYTHONPATH=/workspace/HU_Bot python alphaholdem/src/train_vec_cpp.py \
+    --min-stack 10 --stack 100 --timesteps 100000000
+
+# Resume from checkpoint
+PYTHONPATH=/workspace/HU_Bot python alphaholdem/src/train_vec_cpp.py \
+    --resume alphaholdem/checkpoints/latest.pt --timesteps 100000000
 ```
 
 **Key Features:**
