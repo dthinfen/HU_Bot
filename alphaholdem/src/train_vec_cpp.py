@@ -249,7 +249,7 @@ class VectorizedRolloutBuffer:
                 'observations': torch.tensor(obs_flat[batch_indices], dtype=torch.float32, device=self.device),
                 'actions': torch.tensor(actions_flat[batch_indices], dtype=torch.long, device=self.device),
                 'old_log_probs': torch.tensor(log_probs_flat[batch_indices], dtype=torch.float32, device=self.device),
-                'old_values': torch.tensor(values_flat[batch_indices], dtype=torch.float32, device=self.device),
+                'old_values': torch.tensor(values_flat[batch_indices], dtype=torch.float32, device=self.device),  # For value clipping
                 'advantages': torch.tensor(advantages_flat[batch_indices], dtype=torch.float32, device=self.device),
                 'returns': torch.tensor(returns_flat[batch_indices], dtype=torch.float32, device=self.device),
                 'action_masks': torch.tensor(masks_flat[batch_indices], dtype=torch.bool, device=self.device),
@@ -351,11 +351,13 @@ class CppTrainer:
             fc_num_layers=config.fc_num_layers
         ).to(self.device)
 
-        # PPO
+        # PPO - AlphaHoldem paper settings
         ppo_config = PPOConfig(
             learning_rate=1e-4,
-            clip_ratio=0.2,
-            num_epochs=3,
+            clip_ratio=3.0,      # Paper: δ1=3 for Trinal-Clip (NOT 0.2)
+            gamma=0.999,         # Paper: 0.999 discount factor
+            gae_lambda=0.95,     # Paper: λ=0.95
+            num_epochs=4,        # Paper: 4 epochs
             minibatch_size=256,
             batch_size=config.steps_per_update
         )
@@ -392,6 +394,10 @@ class CppTrainer:
         self.episode_rewards: deque = deque(maxlen=5000)
         self.opponent: Optional[ActorCritic] = None
         self._current_opp_elo = None
+
+        # Speed tracking (instantaneous)
+        self._last_update_time = None
+        self._last_timesteps = 0
 
         # Warmup tracking
         self.warmup_model: Optional[ActorCritic] = None
@@ -511,16 +517,35 @@ class CppTrainer:
         return obs, action_masks
 
     def _ppo_update(self):
+        """
+        PPO update with Trinal-Clip from AlphaHoldem paper.
+
+        Trinal-Clip uses three clipping bounds:
+        - δ1 = 3.0: Upper bound on policy ratio (prevents too aggressive updates)
+        - δ2, δ3: Dynamic bounds for negative advantages (based on pot size)
+
+        For negative advantages (bad actions), we want to decrease probability
+        but not too aggressively on high-variance hands.
+        """
         total_policy_loss = 0
         total_value_loss = 0
         total_entropy = 0
         num_updates = 0
+
+        # Trinal-Clip hyperparameters (from paper)
+        delta1 = self.ppo.config.clip_ratio  # 3.0 (upper bound)
+        # δ2 and δ3 are dynamic based on chips, but we approximate with fixed values
+        # Paper says range is 0 to 20000 based on chips played
+        # We use conservative fixed bounds for stability
+        delta2 = 0.5   # Lower bound for negative advantage clipping
+        delta3 = 1.5   # Upper bound for negative advantage clipping
 
         for epoch in range(self.ppo.config.num_epochs):
             for batch in self.buffer.get_batches(self.ppo.config.minibatch_size):
                 obs = batch['observations']
                 actions = batch['actions']
                 old_log_probs = batch['old_log_probs']
+                old_values = batch['old_values']
                 advantages = batch['advantages']
                 returns = batch['returns']
                 action_masks = batch['action_masks']
@@ -528,10 +553,36 @@ class CppTrainer:
                 new_log_probs, values, entropy = self.model.evaluate_actions(obs, actions, action_masks)
 
                 ratio = torch.exp(new_log_probs - old_log_probs)
-                clipped_ratio = torch.clamp(ratio, 1 - self.ppo.config.clip_ratio, 1 + self.ppo.config.clip_ratio)
-                policy_loss = torch.max(-advantages * ratio, -advantages * clipped_ratio).mean()
 
-                value_loss = 0.5 * ((values - returns) ** 2).mean()
+                # Trinal-Clip Policy Loss
+                # For positive advantages: clip(ratio, 1-ε, δ1) where δ1=3
+                # For negative advantages: clip(ratio, δ2, δ3) for stability on bad hands
+
+                # Standard PPO term
+                surr1 = ratio * advantages
+
+                # Trinal-Clip: different clipping for positive vs negative advantages
+                pos_adv_mask = (advantages >= 0).float()
+                neg_adv_mask = (advantages < 0).float()
+
+                # Positive advantages: use upper clip δ1=3 (allow ratio up to 3x)
+                clipped_ratio_pos = torch.clamp(ratio, 1.0 - 0.2, delta1)
+
+                # Negative advantages: use tighter clip [δ2, δ3] for stability
+                clipped_ratio_neg = torch.clamp(ratio, delta2, delta3)
+
+                clipped_ratio = pos_adv_mask * clipped_ratio_pos + neg_adv_mask * clipped_ratio_neg
+                surr2 = clipped_ratio * advantages
+
+                # Take minimum (pessimistic bound) - this is the PPO objective
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # Value loss with clipping (prevents value function from changing too fast)
+                value_clipped = old_values + torch.clamp(values - old_values, -0.2, 0.2)
+                value_loss1 = (values - returns) ** 2
+                value_loss2 = (value_clipped - returns) ** 2
+                value_loss = 0.5 * torch.max(value_loss1, value_loss2).mean()
+
                 entropy_loss = -entropy.mean()
 
                 loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
@@ -556,26 +607,38 @@ class CppTrainer:
         }
 
     def _make_opponent_policy(self):
-        """Create opponent policy function for C++ env."""
+        """Create opponent policy function for C++ env.
+
+        Optimized for speed:
+        - Pre-allocated tensors to avoid allocation overhead
+        - Model stays on GPU
+        - Minimal Python overhead
+        """
+        # Pre-allocate tensors once (avoid allocation per call)
+        obs_buffer = torch.zeros(1, 38, 4, 13, dtype=torch.float32, device=self.device)
+        mask_buffer = torch.zeros(1, self.config.num_actions, dtype=torch.bool, device=self.device)
+        noise = 0.05 / self.config.num_actions
+
         def policy(obs, mask):
             if self.opponent is None:
                 valid = np.where(mask)[0]
                 return int(np.random.choice(valid)) if len(valid) > 0 else 1
 
-            with torch.no_grad():
-                obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-                mask_tensor = torch.tensor(mask, dtype=torch.bool, device=self.device).unsqueeze(0)
+            # Copy data into pre-allocated buffers (faster than creating new tensors)
+            obs_buffer[0] = torch.from_numpy(obs).to(self.device)
+            mask_buffer[0] = torch.from_numpy(mask).to(self.device)
 
-                logits, _ = self.opponent(obs_tensor, mask_tensor)
+            with torch.no_grad():
+                logits, _ = self.opponent(obs_buffer, mask_buffer)
                 probs = torch.softmax(logits, dim=-1)
 
-                # Stochastic
-                probs = probs * 0.95 + 0.05 / self.config.num_actions
+                # Stochastic with exploration
+                probs = probs * 0.95 + noise
                 probs = probs / probs.sum()
 
-                dist = torch.distributions.Categorical(probs)
-                action = dist.sample()
-                return action.item()
+                # Sample action
+                action = torch.multinomial(probs, 1).item()
+                return action
 
         return policy
 
@@ -699,9 +762,23 @@ class CppTrainer:
         print(f"Loaded: update={self.update_count}, steps={self.total_timesteps:,}")
 
     def _log_progress(self, stats, start_time):
-        elapsed = time.time() - start_time
-        steps_per_sec = self.total_timesteps / max(elapsed, 1)
-        eta = (self.config.total_timesteps - self.total_timesteps) / max(steps_per_sec, 1)
+        current_time = time.time()
+        elapsed = current_time - start_time
+
+        # Instantaneous speed (this update only)
+        if self._last_update_time is not None:
+            update_elapsed = current_time - self._last_update_time
+            update_steps = self.total_timesteps - self._last_timesteps
+            instant_speed = update_steps / max(update_elapsed, 0.001)
+        else:
+            instant_speed = self.total_timesteps / max(elapsed, 1)
+
+        self._last_update_time = current_time
+        self._last_timesteps = self.total_timesteps
+
+        # ETA based on instantaneous speed (more accurate)
+        remaining = self.config.total_timesteps - self.total_timesteps
+        eta = remaining / max(instant_speed, 1)
 
         mean_reward = np.mean(list(self.episode_rewards)) if self.episode_rewards else 0
         bb_per_100 = mean_reward * 100
@@ -719,7 +796,7 @@ class CppTrainer:
               f"Hands: {self.total_hands:,} | "
               f"bb/100: {bb_per_100:+.1f} | "
               f"{phase_str}{pool_str} | "
-              f"Steps/s: {steps_per_sec:.0f} | "
+              f"Steps/s: {instant_speed:.0f} | "
               f"ETA: {eta/3600:.1f}h")
 
 
