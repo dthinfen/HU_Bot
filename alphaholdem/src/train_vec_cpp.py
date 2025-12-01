@@ -31,6 +31,15 @@ from alphaholdem.src.network import ActorCritic
 from alphaholdem.src.ppo import PPO, PPOConfig
 
 
+def get_raw_state_dict(model):
+    """Get state dict from model, stripping torch.compile's _orig_mod. prefix if present."""
+    state_dict = model.state_dict()
+    # torch.compile wraps model and adds _orig_mod. prefix to all keys
+    if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+    return state_dict
+
+
 @dataclass
 class TrainConfig:
     """Training configuration."""
@@ -484,7 +493,7 @@ class KBestPool:
 
     def add_agent(self, model: ActorCritic, elo: float, update_num: int, bb_per_100: float = 0.0):
         path = self.checkpoint_dir / f"agent_{update_num}.pt"
-        torch.save(model.state_dict(), path)
+        torch.save(get_raw_state_dict(model), path)
 
         self.agents.append({
             'path': str(path),
@@ -668,7 +677,7 @@ class CppTrainer:
                         input_channels=38, use_cnn=True, num_actions=self.config.num_actions,
                         fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
                     ).to(self.device)
-                    self.warmup_model.load_state_dict(self.model.state_dict())
+                    self.warmup_model.load_state_dict(get_raw_state_dict(self.model))
                     self.warmup_model.eval()
                     self.opponent = self.warmup_model
                     # Use BATCHED opponent inference with FP16 (fast!)
@@ -937,7 +946,7 @@ class CppTrainer:
         suffix = "final" if final else f"{self.update_count}"
         path = Path(self.config.checkpoint_dir) / f"checkpoint_{suffix}.pt"
         torch.save({
-            'model_state_dict': self.model.state_dict(),
+            'model_state_dict': get_raw_state_dict(self.model),
             'optimizer_state_dict': self.ppo.optimizer.state_dict(),
             'update_count': self.update_count,
             'total_timesteps': self.total_timesteps,
@@ -948,7 +957,15 @@ class CppTrainer:
 
     def load_checkpoint(self, path: str):
         checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+        # Handle loading into compiled model - strip _orig_mod prefix if present
+        if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+            state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+        # For compiled models, load into the underlying module
+        if hasattr(self.model, '_orig_mod'):
+            self.model._orig_mod.load_state_dict(state_dict)
+        else:
+            self.model.load_state_dict(state_dict)
         self.ppo.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.update_count = checkpoint.get('update_count', 0)
         self.total_timesteps = checkpoint.get('total_timesteps', 0)
