@@ -399,6 +399,36 @@ Note: AlphaHoldem's +111 bb/100 vs GTO Wizard's +19.4 bb/100 may reflect differe
 
 ## Quick Start
 
+### AlphaHoldem-Style RL Training (Recommended)
+
+```bash
+# Clone and build
+git clone https://github.com/dthinfen/HU_Bot.git
+cd HU_Bot/cpp_solver && mkdir -p build && cd build && cmake .. && make -j8
+
+# Train (100M timesteps, ~7-9 hours on A40)
+cd ~/HU_Bot && python3 -m alphaholdem.src.train_vec_cpp --timesteps 100000000
+
+# Monitor
+tail -f training_cpp.log
+```
+
+**Key Features:**
+- **Trinal-Clip PPO** (from AlphaHoldem paper): δ1=3, dynamic δ2/δ3
+- **K-Best Self-Play**: Trains against pool of best historical versions
+- **C++ FastEnv**: 3000-4000 steps/s with batched opponent inference
+- **FP16 Inference**: Mixed precision for speed (FP32 training)
+- **Stochastic Opponents**: Develops balanced frequencies
+
+**Hyperparameters (Paper Settings):**
+- Discount factor: γ=0.999
+- GAE lambda: λ=0.95
+- PPO epochs: 4
+- 512 parallel environments
+- 8.1M parameter CNN
+
+### CFR Solver (Alternative)
+
 ```bash
 # Build C++ solver with neural network support
 cd cpp_solver && ./build.sh
