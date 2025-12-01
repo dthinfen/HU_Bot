@@ -401,16 +401,28 @@ Note: AlphaHoldem's +111 bb/100 vs GTO Wizard's +19.4 bb/100 may reflect differe
 
 ### AlphaHoldem-Style RL Training (Recommended)
 
+**RunPod/Cloud GPU (Full Setup):**
 ```bash
-# Clone and build
+# 1. Clone repository
 git clone https://github.com/dthinfen/HU_Bot.git
-cd HU_Bot/cpp_solver && mkdir -p build && cd build && cmake .. && make -j8
+cd HU_Bot
 
-# Train (100M timesteps, ~7-9 hours on A40)
-cd ~/HU_Bot && python3 -m alphaholdem.src.train_vec_cpp --timesteps 100000000
+# 2. Install dependencies
+pip install torch numpy pybind11
 
-# Monitor
-tail -f training_cpp.log
+# 3. Build C++ Python bindings
+cd cpp_solver && ./build_python.sh && cd ..
+
+# 4. Start training (100M timesteps, ~7-9 hours on A40)
+nohup python3 -m alphaholdem.src.train_vec_cpp --timesteps 100000000 > training_cpp.log 2>&1 &
+
+# 5. Monitor progress
+sleep 3 && tail -f training_cpp.log
+```
+
+**Resume from checkpoint:**
+```bash
+python3 -m alphaholdem.src.train_vec_cpp --timesteps 100000000 --resume
 ```
 
 **Key Features:**
