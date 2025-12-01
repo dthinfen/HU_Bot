@@ -37,9 +37,12 @@ class TrainConfig:
     starting_stack: float = 100.0
     num_actions: int = 14
 
-    # Vectorized training - can use more envs with C++ speed
-    num_envs: int = 256
+    # Vectorized training - more envs = better GPU batching
+    num_envs: int = 512  # Increased from 256 for better GPU utilization
     steps_per_env: int = 128
+
+    # Speed optimizations (don't affect model/accuracy)
+    use_mixed_precision: bool = True  # FP16 inference, FP32 training
 
     # Training
     total_timesteps: int = 100_000_000
@@ -95,11 +98,13 @@ class CppVectorizedEnv:
         # Opponent model for batched inference (set by trainer)
         self.opponent_model = None
         self.opponent_device = 'cpu'
+        self.use_amp = False  # Mixed precision flag
 
-    def set_opponent_model(self, model, device):
+    def set_opponent_model(self, model, device, use_amp=False):
         """Set opponent model for BATCHED inference (fast!)."""
         self.opponent_model = model
         self.opponent_device = device
+        self.use_amp = use_amp and (device != 'cpu')  # AMP only on CUDA
 
     def clear_opponent(self):
         """Clear opponent (random actions)."""
@@ -166,13 +171,16 @@ class CppVectorizedEnv:
                 actions[i] = int(np.random.choice(valid)) if len(valid) > 0 else 1
             return actions
 
-        # BATCHED neural network inference (fast!)
+        # BATCHED neural network inference with FP16 (fast!)
         with torch.no_grad():
             obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=self.opponent_device)
             mask_tensor = torch.tensor(mask_batch, dtype=torch.bool, device=self.opponent_device)
 
-            logits, _ = self.opponent_model(obs_tensor, mask_tensor)
-            probs = torch.softmax(logits, dim=-1)
+            # Use mixed precision for faster inference (doesn't affect accuracy)
+            with torch.amp.autocast(device_type='cuda', enabled=self.use_amp):
+                logits, _ = self.opponent_model(obs_tensor, mask_tensor)
+
+            probs = torch.softmax(logits.float(), dim=-1)
 
             # Stochastic with exploration
             noise = 0.05 / self.num_actions
@@ -474,6 +482,9 @@ class CppTrainer:
         self._last_update_time = None
         self._last_timesteps = 0
 
+        # Mixed precision for faster inference (FP16 inference, FP32 training)
+        self.use_amp = config.use_mixed_precision and (self.device != 'cpu')
+
         # Warmup tracking
         self.warmup_model: Optional[ActorCritic] = None
         self.in_warmup = True
@@ -520,8 +531,8 @@ class CppTrainer:
                     self.warmup_model.load_state_dict(self.model.state_dict())
                     self.warmup_model.eval()
                     self.opponent = self.warmup_model
-                    # Use BATCHED opponent inference (fast!)
-                    self.vec_env.set_opponent_model(self.opponent, self.device)
+                    # Use BATCHED opponent inference with FP16 (fast!)
+                    self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
                     self.in_warmup = False
                     self._current_opp_elo = self.config.initial_elo
 
@@ -561,8 +572,11 @@ class CppTrainer:
                 obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device)
                 mask_tensor = torch.tensor(action_masks, dtype=torch.bool, device=self.device)
 
-                logits, values = self.model(obs_tensor, mask_tensor)
-                probs = torch.softmax(logits, dim=-1)
+                # FP16 inference for speed (doesn't affect model accuracy)
+                with torch.amp.autocast(device_type='cuda', enabled=self.use_amp):
+                    logits, values = self.model(obs_tensor, mask_tensor)
+
+                probs = torch.softmax(logits.float(), dim=-1)
 
                 # Exploration noise
                 probs = probs * 0.99 + 0.01 / self.config.num_actions
@@ -723,15 +737,15 @@ class CppTrainer:
             if self.warmup_model is not None:
                 self.opponent = self.warmup_model
                 self._current_opp_elo = self.config.initial_elo
-                self.vec_env.set_opponent_model(self.opponent, self.device)
+                self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
         else:
             opponent, agent_info = self.opponent_pool.sample_opponent(ActorCritic, self.config.num_actions)
             if opponent is not None:
                 self.opponent = opponent.to(self.device)
                 self.opponent.eval()
                 self._current_opp_elo = agent_info['elo']
-                # Use BATCHED opponent inference (fast!)
-                self.vec_env.set_opponent_model(self.opponent, self.device)
+                # Use BATCHED opponent inference with FP16 (fast!)
+                self.vec_env.set_opponent_model(self.opponent, self.device, self.use_amp)
                 print(f"  [OPPONENT] Switched to agent_{agent_info['update_num']} (ELO={agent_info['elo']:.0f})")
 
     def _evaluate_for_pool(self):
