@@ -674,10 +674,10 @@ class VectorizedTrainerV2:
                 # Get final payoff from terminal state
                 game_reward = self.eval_env.state.get_payoff(0)
 
-                # Win/loss counting
-                if game_reward > 0.5:  # Clear win
+                # Win/loss counting (use small epsilon for floating point)
+                if game_reward > 0.01:  # Win
                     wins += 1
-                elif game_reward < -0.5:  # Clear loss
+                elif game_reward < -0.01:  # Loss
                     losses += 1
                 else:  # Draw (chopped pot, etc.)
                     draws += 1
@@ -700,6 +700,8 @@ class VectorizedTrainerV2:
                 'losses': losses,
                 'score': score
             })
+            # Debug: print matchup details
+            print(f"    vs agent_{agent_info['update_num']}: W={wins} D={draws} L={losses} score={score:.2f}")
 
         self.model.train()
         win_rate = total_wins / total_games if total_games > 0 else 0.5
