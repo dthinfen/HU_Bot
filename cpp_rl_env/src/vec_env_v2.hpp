@@ -353,7 +353,11 @@ private:
         std::array<float, NUM_ACTIONS> mask{};
         const auto& state = states_[env_idx];
 
-        if (state.is_terminal()) return mask;
+        // Safety: if terminal, return check/call as valid (will be ignored anyway)
+        if (state.is_terminal()) {
+            mask[1] = 1.0f;
+            return mask;
+        }
 
         float to_call = state.to_call();
         float stack = (player == 0) ? state.hero_stack : state.villain_stack;

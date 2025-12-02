@@ -457,7 +457,15 @@ class VectorizedTrainerV2:
                 probs = probs * 0.99 + 0.01 / self.config.num_actions
                 # Re-apply mask to zero out invalid actions after adding noise
                 probs = probs * mask_tensor.float()
-                # Renormalize with epsilon to avoid numerical issues
+
+                # Safety: if mask is all zeros, default to check/call
+                mask_sum = mask_tensor.float().sum(dim=-1, keepdim=True)
+                empty_mask = (mask_sum == 0)
+                if empty_mask.any():
+                    # Set check/call (action 1) for envs with empty masks
+                    probs[empty_mask.squeeze(-1), 1] = 1.0
+
+                # Renormalize
                 probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
                 probs = probs.clamp(min=1e-8)
                 probs = probs / probs.sum(dim=-1, keepdim=True)
