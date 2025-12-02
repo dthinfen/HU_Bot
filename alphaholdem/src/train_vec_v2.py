@@ -181,7 +181,7 @@ class TrainConfig:
     gc_every: int = 10  # Run garbage collection every N updates
 
     # C++ environment (10-100x faster)
-    use_cpp_env: bool = False
+    use_cpp_env: bool = True  # Use C++ env for speed (with two-phase stepping fix)
 
     # Paths
     checkpoint_dir: str = "alphaholdem/checkpoints"
