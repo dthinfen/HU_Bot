@@ -336,6 +336,8 @@ class VectorizedTrainerV2:
 
                 # Add small exploration noise for stability
                 probs = probs * 0.99 + 0.01 / self.config.num_actions
+                # Re-apply mask to zero out invalid actions after adding noise
+                probs = probs * mask_tensor.float()
                 probs = probs / probs.sum(dim=-1, keepdim=True)
 
                 dist = torch.distributions.Categorical(probs)
