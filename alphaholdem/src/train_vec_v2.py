@@ -573,10 +573,14 @@ class VectorizedTrainerV2:
             logits, _ = self.opponent(obs_tensor, mask_tensor)
             probs = torch.softmax(logits, dim=-1)
 
-            # Small exploration
+            # Small exploration noise
             probs = probs * 0.95 + 0.05 / self.config.num_actions
             # Re-apply mask
             probs = probs * mask_tensor.float()
+            # Renormalize (add eps to avoid div by zero)
+            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+            # Clamp to valid range for Categorical
+            probs = probs.clamp(min=1e-8)
             probs = probs / probs.sum(dim=-1, keepdim=True)
 
             dist = torch.distributions.Categorical(probs)
