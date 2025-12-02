@@ -41,6 +41,13 @@ class VectorizedHeadsUpEnv:
         # Opponent policy (shared across all envs)
         self._opponent_policy: Optional[Callable] = None
 
+        # Pre-allocate arrays to avoid repeated allocation
+        self._obs_buffer = np.zeros((num_envs, 50, 4, 13), dtype=np.float32)
+        self._mask_buffer = np.zeros((num_envs, num_actions), dtype=np.float32)
+        self._reward_buffer = np.zeros(num_envs, dtype=np.float32)
+        self._done_buffer = np.zeros(num_envs, dtype=bool)
+        self._reset_buffer = np.zeros(num_envs, dtype=bool)
+
     def set_opponent(self, policy: Optional[Callable]):
         """Set opponent policy for all environments."""
         self._opponent_policy = policy
@@ -56,22 +63,16 @@ class VectorizedHeadsUpEnv:
             observations: (num_envs, 50, 4, 13) tensor
             action_masks: (num_envs, num_actions) boolean array
         """
-        observations = []
-        action_masks = []
-
         for i, env in enumerate(self.envs):
             env.reset()
             if self._opponent_policy is not None:
                 env.set_opponent(self._opponent_policy)
 
-            obs = self._get_obs(env)
-            mask = env.get_action_mask()
-
-            observations.append(obs)
-            action_masks.append(mask)
+            self._obs_buffer[i] = self._get_obs(env)
+            self._mask_buffer[i] = env.get_action_mask()
             self.dones[i] = False
 
-        return np.array(observations), np.array(action_masks)
+        return self._obs_buffer.copy(), self._mask_buffer.copy()
 
     def reset_done_envs(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -82,9 +83,7 @@ class VectorizedHeadsUpEnv:
             action_masks: (num_envs, num_actions)
             reset_mask: (num_envs,) boolean - which envs were reset
         """
-        observations = []
-        action_masks = []
-        reset_mask = np.zeros(self.num_envs, dtype=bool)
+        self._reset_buffer[:] = False
 
         for i, env in enumerate(self.envs):
             # Reset if done, terminal, or if action mask would be empty
@@ -101,19 +100,16 @@ class VectorizedHeadsUpEnv:
                 if self._opponent_policy is not None:
                     env.set_opponent(self._opponent_policy)
                 self.dones[i] = False
-                reset_mask[i] = True
+                self._reset_buffer[i] = True
 
-            obs = self._get_obs(env)
-            mask = env.get_action_mask()
+            self._obs_buffer[i] = self._get_obs(env)
+            self._mask_buffer[i] = env.get_action_mask()
 
             # Safety: ensure at least one action is valid
-            if not mask.any():
-                mask[1] = True  # Fallback to call (should never happen after reset)
+            if not self._mask_buffer[i].any():
+                self._mask_buffer[i, 1] = True  # Fallback to call
 
-            observations.append(obs)
-            action_masks.append(mask)
-
-        return np.array(observations), np.array(action_masks), reset_mask
+        return self._obs_buffer.copy(), self._mask_buffer.copy(), self._reset_buffer.copy()
 
     def step(self, actions: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[dict]]:
         """
@@ -129,56 +125,40 @@ class VectorizedHeadsUpEnv:
             dones: (num_envs,)
             infos: list of info dicts
         """
-        observations = []
-        action_masks = []
-        rewards = np.zeros(self.num_envs, dtype=np.float32)
-        dones = np.zeros(self.num_envs, dtype=bool)
-        infos = []
+        self._reward_buffer[:] = 0.0
+        self._done_buffer[:] = False
+        infos = [None] * self.num_envs  # Pre-allocate list
 
         for i, (env, action) in enumerate(zip(self.envs, actions)):
             # Skip if already done (will be reset next call)
             if self.dones[i]:
-                obs = self._get_obs(env)
-                mask = env.get_action_mask()
-                observations.append(obs)
-                action_masks.append(mask)
-                infos.append({})
+                self._obs_buffer[i] = self._get_obs(env)
+                self._mask_buffer[i] = env.get_action_mask()
+                infos[i] = {}
                 continue
 
             # Check if terminal from opponent's action
             if env.state.is_terminal():
-                reward = env.state.get_payoff(0)
-                rewards[i] = reward
-                dones[i] = True
+                self._reward_buffer[i] = env.state.get_payoff(0)
+                self._done_buffer[i] = True
                 self.dones[i] = True
-
-                # Get dummy obs (will be reset)
-                obs = self._get_obs(env)
-                mask = env.get_action_mask()
-                observations.append(obs)
-                action_masks.append(mask)
-                infos.append({'terminal_from_opponent': True})
+                self._obs_buffer[i] = self._get_obs(env)
+                self._mask_buffer[i] = env.get_action_mask()
+                infos[i] = {'terminal_from_opponent': True}
                 continue
 
             # Step environment
-            obs, reward, done, info = env.step(int(action))
+            _, reward, done, info = env.step(int(action))
 
-            rewards[i] = reward
-            dones[i] = done
+            self._reward_buffer[i] = reward
+            self._done_buffer[i] = done
             self.dones[i] = done
 
-            if not done:
-                obs = self._get_obs(env)
-            else:
-                obs = self._get_obs(env)  # Dummy, will be reset
+            self._obs_buffer[i] = self._get_obs(env)
+            self._mask_buffer[i] = env.get_action_mask()
+            infos[i] = info
 
-            mask = env.get_action_mask()
-
-            observations.append(obs)
-            action_masks.append(mask)
-            infos.append(info)
-
-        return np.array(observations), np.array(action_masks), rewards, dones, infos
+        return self._obs_buffer.copy(), self._mask_buffer.copy(), self._reward_buffer.copy(), self._done_buffer.copy(), infos
 
     def _get_obs(self, env: HeadsUpEnv) -> np.ndarray:
         """Get encoded observation from environment."""
