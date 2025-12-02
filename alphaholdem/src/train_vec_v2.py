@@ -1,9 +1,10 @@
 """
 AlphaHoldem Vectorized Training v2
 
-Fixes:
+Features:
 - Self-play warmup before first pool addition
-- Better ELO tracking with draws
+- bb/100 profit-based agent ranking (not ELO)
+- PFSP (Prioritized Fictitious Self-Play) opponent selection
 - Memory-efficient rollout collection
 - Periodic GC to prevent memory leaks
 """
@@ -151,9 +152,7 @@ class TrainConfig:
     eval_for_pool_every: int = 25  # More frequent pool evaluation
     min_updates_for_pool: int = 100  # Wait for 100 updates before first pool agent
     warmup_self_play_updates: int = 50  # Self-play warmup before pool
-    elo_games_per_matchup: int = 200  # More games for better estimates
-    initial_elo: float = 1500.0
-    elo_k_factor: float = 16.0  # Reduced for stability
+    eval_games_per_matchup: int = 200  # Games per matchup for bb/100 estimation
 
     # Network
     hidden_dim: int = 256
@@ -188,10 +187,9 @@ class TrainConfig:
 
 
 class KBestPool:
-    """Pool of K-best agents with improved ELO handling."""
+    """Pool of K-best agents ranked by bb/100 with PFSP opponent selection."""
 
-    def __init__(self, k: int, checkpoint_dir: str, initial_elo: float = 1500.0, k_factor: float = 16.0,
-                 fc_hidden_dim: int = 1024, fc_num_layers: int = 4):
+    def __init__(self, k: int, checkpoint_dir: str, fc_hidden_dim: int = 1024, fc_num_layers: int = 4):
         self.k = k
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -332,8 +330,6 @@ class VectorizedTrainerV2:
         self.opponent_pool = KBestPool(
             config.k_best,
             config.checkpoint_dir,
-            initial_elo=config.initial_elo,
-            k_factor=config.elo_k_factor,
             fc_hidden_dim=config.fc_hidden_dim,
             fc_num_layers=config.fc_num_layers
         )
@@ -684,7 +680,7 @@ class VectorizedTrainerV2:
             self.opponent = opponent
 
             matchup_profit = 0.0
-            games = self.config.elo_games_per_matchup
+            games = self.config.eval_games_per_matchup
 
             for game_idx in range(games):
                 self.eval_env.reset()
