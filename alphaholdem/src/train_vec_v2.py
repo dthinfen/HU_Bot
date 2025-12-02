@@ -170,7 +170,7 @@ class TrainConfig:
     use_cnn: bool = True
 
     # PPO hyperparameters
-    entropy_coef: float = 0.05  # Entropy bonus (higher = more exploration)
+    entropy_coef: float = 0.01  # Paper: 0.01 (clip_ratio=3.0 provides exploration)
 
     # Checkpointing
     save_every: int = 50
@@ -324,11 +324,11 @@ class VectorizedTrainerV2:
             fc_num_layers=config.fc_num_layers
         ).to(self.device)
 
-        # PPO with tuned hyperparameters
+        # PPO with AlphaHoldem hyperparameters
         ppo_config = PPOConfig(
-            learning_rate=1e-4,  # Lower LR for stability
-            clip_ratio=0.2,
-            num_epochs=3,  # Fewer epochs to prevent overfitting
+            learning_rate=3e-4,  # Paper: 0.0003
+            clip_ratio=3.0,  # Paper: Trinal-Clip δ1=3
+            num_epochs=4,  # Paper default
             minibatch_size=256,
             batch_size=config.steps_per_update
         )
@@ -839,8 +839,8 @@ def main():
     parser.add_argument('--checkpoint-dir', type=str, default='alphaholdem/checkpoints')
     parser.add_argument('--log-dir', type=str, default='alphaholdem/logs')
     parser.add_argument('--resume', type=str, default=None)
-    parser.add_argument('--entropy-coef', type=float, default=0.05,
-                        help='Entropy coefficient (higher = more exploration, default 0.05)')
+    parser.add_argument('--entropy-coef', type=float, default=0.01,
+                        help='Entropy coefficient (default 0.01, AlphaHoldem paper)')
     parser.add_argument('--use-cpp-env', action='store_true',
                         help='Use C++ environment for 10-100x faster warmup (auto-switches to Python for self-play)')
     args = parser.parse_args()
