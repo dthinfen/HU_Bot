@@ -52,6 +52,14 @@ public:
     void reset(float* obs_out, float* masks_out) {
         for (int i = 0; i < num_envs_; i++) {
             reset_env(i);
+
+            // Let opponent act first if it's their turn (when hero is BB)
+            while (!states_[i].is_terminal() && states_[i].current_player == 1) {
+                int opp_action = random_action(i, 1);
+                apply_action(i, opp_action, 1);
+                maybe_advance_street(i);
+            }
+
             encode_hero_obs(i, obs_out + i * OBS_SIZE);
             get_hero_mask(i, masks_out + i * NUM_ACTIONS);
         }
@@ -73,6 +81,14 @@ public:
             if (dones_[i]) {
                 // Reset and output new state
                 reset_env(i);
+
+                // Let opponent act first if it's their turn (when hero is BB)
+                while (!states_[i].is_terminal() && states_[i].current_player == 1) {
+                    int opp_action = random_action(i, 1);
+                    apply_action(i, opp_action, 1);
+                    maybe_advance_street(i);
+                }
+
                 encode_hero_obs(i, obs_out + i * OBS_SIZE);
                 get_hero_mask(i, masks_out + i * NUM_ACTIONS);
                 rewards_out[i] = 0.0f;
