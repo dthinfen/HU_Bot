@@ -70,6 +70,9 @@ class HeadsUpEnv:
         self.opponent_policy: Optional[Callable] = None
         self.hero_player: int = 0  # We always train player 0
 
+        # Cache encoder to avoid creating new one every opponent action
+        self._opponent_encoder = None
+
     def reset(self) -> None:
         """Reset environment for new hand."""
         # Random button
@@ -359,8 +362,11 @@ class HeadsUpEnv:
 
     def _get_opponent_obs(self) -> np.ndarray:
         """Get observation from opponent's perspective."""
-        from alphaholdem.src.encoder import AlphaHoldemEncoder
-        encoder = AlphaHoldemEncoder()
+        # Use cached encoder to avoid creating new object every call
+        if self._opponent_encoder is None:
+            from alphaholdem.src.encoder import AlphaHoldemEncoder
+            self._opponent_encoder = AlphaHoldemEncoder()
+        encoder = self._opponent_encoder
 
         # Swap hero/villain perspective
         if self.hero_player == 0:
