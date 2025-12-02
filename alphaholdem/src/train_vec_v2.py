@@ -556,8 +556,8 @@ class VectorizedTrainerV2:
                 # Value loss with clipping
                 value_clipped = old_values + torch.clamp(
                     values - old_values,
-                    -self.ppo.config.clip_ratio,
-                    self.ppo.config.clip_ratio
+                    -self.ppo.config.clip_value,
+                    self.ppo.config.clip_value
                 )
                 value_loss1 = (values - returns) ** 2
                 value_loss2 = (value_clipped - returns) ** 2
