@@ -737,7 +737,7 @@ class VectorizedTrainerV2:
                 'profit': matchup_profit,
                 'bb_per_100': bb_per_100,
             })
-            print(f"    vs agent_{agent_info['update_num']}: bb/100={bb_per_100:+.1f}")
+            print(f"    vs agent_{agent_info['update_num']}: bb/100={bb_per_100:+.2f} (profit={matchup_profit:.1f} over {games} games)")
 
         self.model.train()
         overall_bb_per_100 = (total_profit / total_games) * 100 if total_games > 0 else 0.0
