@@ -777,7 +777,8 @@ class VectorizedTrainerV2:
             'update_count': self.update_count,
             'total_timesteps': self.total_timesteps,
             'total_hands': self.total_hands,
-            'config': asdict(self.config)
+            'config': asdict(self.config),
+            'pool_agents': self.opponent_pool.agents,  # Save pool state
         }, path)
         print(f"Saved checkpoint: {path}")
 
@@ -789,19 +790,34 @@ class VectorizedTrainerV2:
         self.total_timesteps = checkpoint.get('total_timesteps', 0)
         self.total_hands = checkpoint.get('total_hands', 0)
 
-        # If resuming past warmup, setup self-play opponent
+        # Restore pool state if available
+        if 'pool_agents' in checkpoint:
+            self.opponent_pool.agents = checkpoint['pool_agents']
+            print(f"  Restored pool with {len(self.opponent_pool.agents)} agents")
+
+        # If resuming past warmup, setup opponent
         if self.update_count >= self.config.warmup_self_play_updates:
             self.in_warmup = False
-            self.warmup_model = ActorCritic(
-                input_channels=50, use_cnn=True, num_actions=self.config.num_actions,
-                fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
-            ).to(self.device)
-            self.warmup_model.load_state_dict(self.model.state_dict())
-            self.warmup_model.eval()
-            self.opponent = self.warmup_model
-            self._current_opp_id = "self"
+
+            # If pool has agents, use pool opponent; otherwise use self-play
+            if len(self.opponent_pool.agents) > 0:
+                opponent, agent_info = self.opponent_pool.sample_opponent(ActorCritic, self.config.num_actions)
+                self.opponent = opponent.to(self.device)
+                self.opponent.eval()
+                self._current_opp_id = agent_info['update_num']
+                print(f"  Resuming with pool opponent agent_{self._current_opp_id}")
+            else:
+                self.warmup_model = ActorCritic(
+                    input_channels=50, use_cnn=True, num_actions=self.config.num_actions,
+                    fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
+                ).to(self.device)
+                self.warmup_model.load_state_dict(self.model.state_dict())
+                self.warmup_model.eval()
+                self.opponent = self.warmup_model
+                self._current_opp_id = "self"
+                print(f"  Resuming in self-play mode")
+
             self.vec_env.set_opponent(self._batched_opponent_policy)
-            print(f"  Resuming in self-play mode")
 
         print(f"Loaded: update={self.update_count}, steps={self.total_timesteps:,}")
 
