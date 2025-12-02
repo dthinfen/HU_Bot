@@ -34,6 +34,9 @@ from dataclasses import dataclass
 # Add solver to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'cpp_solver', 'build'))
 
+# Add alphaholdem to path
+sys.path.insert(0, os.path.dirname(__file__))
+
 # Also ensure we can import ares_solver
 try:
     import ares_solver
@@ -719,6 +722,632 @@ class RealtimeSearchAgent(BaseAgent):
             return 'c' if state.to_call > 0 else 'k'
 
 
+class NeuralNetworkAgent(BaseAgent):
+    """
+    Agent using trained AlphaHoldem-style neural network checkpoint.
+
+    Loads an ActorCritic model from a training checkpoint and uses it
+    to play against Slumbot. Supports both old (38-channel) and new (50-channel)
+    checkpoint formats.
+    """
+
+    # Action space mapping (matching C++ FastEnv action_to_index):
+    # 0: Fold
+    # 1: Check/Call
+    # 2: <0.4x pot  -> use 0.3x
+    # 3: 0.4-0.6x   -> use 0.5x
+    # 4: 0.6-0.8x   -> use 0.7x
+    # 5: 0.8-1.0x   -> use 0.9x
+    # 6: 1.0-1.5x   -> use 1.25x
+    # 7: 1.5-2.0x   -> use 1.75x
+    # 8: 2.0-3.0x   -> use 2.5x
+    # 9-12: 3.0+x   -> use increasing sizes
+    # 13: All-in
+    NUM_ACTIONS = 14
+    BET_SIZES = [0.3, 0.5, 0.7, 0.9, 1.25, 1.75, 2.5, 3.5, 4.5, 5.5, 6.5]
+    ACTION_NAMES = ['Fold', 'Check/Call', 'Bet 0.3x', 'Bet 0.5x', 'Bet 0.7x', 'Bet 0.9x',
+                    'Bet 1.25x', 'Bet 1.75x', 'Bet 2.5x', 'Bet 3.5x', 'Bet 4.5x',
+                    'Bet 5.5x', 'Bet 6.5x', 'All-in']
+
+    def __init__(self, checkpoint_path: str, device: str = 'cpu'):
+        try:
+            import torch
+            import torch.nn.functional as F
+
+            self.torch = torch
+            self.F = F
+
+            # Load checkpoint first to detect architecture
+            self.device = device
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            state_dict = checkpoint['model_state_dict']
+
+            # Handle compiled model prefix
+            if any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+                state_dict = {k.replace('_orig_mod.', ''): v for k, v in state_dict.items()}
+
+            # Detect architecture from checkpoint
+            input_conv_shape = state_dict['backbone.input_conv.weight'].shape
+            self.input_channels = input_conv_shape[1]
+
+            # Detect head structure (old vs new)
+            has_old_heads = 'policy_head.fc1.weight' in state_dict
+            has_new_heads = 'policy_head.fc_layers.0.weight' in state_dict
+
+            print(f"Detected architecture: {self.input_channels} input channels")
+
+            if has_old_heads:
+                print("  Using legacy head structure (fc1/fc2)")
+                # Use legacy model definition
+                self.model = self._create_legacy_model(
+                    input_channels=self.input_channels,
+                    hidden_dim=checkpoint.get('config', {}).get('hidden_dim', 256)
+                ).to(device)
+            elif has_new_heads:
+                print("  Using new head structure (fc_layers)")
+                from alphaholdem.src.network import ActorCritic
+
+                # Get config from checkpoint
+                config = checkpoint.get('config', {})
+                fc_hidden_dim = config.get('fc_hidden_dim', checkpoint.get('fc_hidden_dim', 1024))
+                fc_num_layers = config.get('fc_num_layers', checkpoint.get('fc_num_layers', 3))
+
+                print(f"  FC hidden dim: {fc_hidden_dim}, FC layers: {fc_num_layers}")
+
+                self.model = ActorCritic(
+                    input_channels=self.input_channels,
+                    use_cnn=True,
+                    num_actions=self.NUM_ACTIONS,
+                    fc_hidden_dim=fc_hidden_dim,
+                    fc_num_layers=fc_num_layers
+                ).to(device)
+            else:
+                raise ValueError("Unknown model architecture in checkpoint")
+
+            # Load weights
+            self.model.load_state_dict(state_dict)
+            self.model.eval()
+
+            # Get update count for info
+            update_count = checkpoint.get('update_count', 0)
+            print(f"Neural Network Agent loaded: {checkpoint_path}")
+            print(f"  Update count: {update_count}")
+            print(f"  Parameters: {sum(p.numel() for p in self.model.parameters()):,}")
+            print(f"  Device: {device}")
+
+            # Action distribution tracking
+            self.action_counts = [0] * self.NUM_ACTIONS
+            self.action_by_street = [[0] * self.NUM_ACTIONS for _ in range(4)]  # preflop, flop, turn, river
+            self.total_decisions = 0
+
+        except Exception as e:
+            print(f"ERROR loading checkpoint: {e}")
+            raise
+
+    def _create_legacy_model(self, input_channels: int, hidden_dim: int):
+        """Create model with legacy head structure (fc1/fc2)."""
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+        from alphaholdem.src.network import CNNBackbone
+
+        class LegacyPolicyHead(nn.Module):
+            """Legacy policy head with fc1/fc2."""
+            def __init__(self, hidden_dim, num_actions):
+                super().__init__()
+                self.fc1 = nn.Linear(hidden_dim, 128)
+                self.fc2 = nn.Linear(128, num_actions)
+
+            def forward(self, x, action_mask=None):
+                x = F.relu(self.fc1(x))
+                logits = self.fc2(x)
+                if action_mask is not None:
+                    logits = logits.masked_fill(~action_mask.bool(), float('-inf'))
+                return logits
+
+        class LegacyValueHead(nn.Module):
+            """Legacy value head with fc1/fc2."""
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.fc1 = nn.Linear(hidden_dim, 128)
+                self.fc2 = nn.Linear(128, 1)
+
+            def forward(self, x):
+                x = F.relu(self.fc1(x))
+                return self.fc2(x).squeeze(-1)
+
+        class LegacyActorCritic(nn.Module):
+            """Legacy model structure for old checkpoints."""
+
+            def __init__(self, input_channels, hidden_dim, num_actions):
+                super().__init__()
+                self.backbone = CNNBackbone(
+                    input_channels=input_channels,
+                    hidden_channels=128,
+                    num_residual_blocks=4,
+                    output_dim=hidden_dim
+                )
+                self.policy_head = LegacyPolicyHead(hidden_dim, num_actions)
+                self.value_head = LegacyValueHead(hidden_dim)
+                self.num_actions = num_actions
+
+            def forward(self, x, action_mask=None):
+                features = self.backbone(x)
+                logits = self.policy_head(features, action_mask)
+                value = self.value_head(features)
+                return logits, value
+
+        return LegacyActorCritic(input_channels, hidden_dim, self.NUM_ACTIONS)
+
+    def get_action(self, hole_cards, board, action_history, client_pos, state):
+        """Get action from neural network."""
+        # Encode observation (use appropriate encoding based on detected architecture)
+        if self.input_channels == 38:
+            obs = self._encode_observation_38ch(hole_cards, board, action_history, client_pos, state)
+        else:
+            obs = self._encode_observation(hole_cards, board, action_history, client_pos, state)
+        obs_tensor = self.torch.tensor(obs, dtype=self.torch.float32, device=self.device).unsqueeze(0)
+
+        # Get action mask
+        action_mask = self._get_action_mask(state)
+        mask_tensor = self.torch.tensor(action_mask, dtype=self.torch.bool, device=self.device).unsqueeze(0)
+
+        # Forward pass
+        with self.torch.no_grad():
+            logits, _ = self.model(obs_tensor, mask_tensor)
+            probs = self.F.softmax(logits, dim=-1).squeeze(0).cpu().numpy()
+
+        # Sample action (with small exploration noise for robustness)
+        probs = probs * 0.95 + 0.05 / self.NUM_ACTIONS
+        probs = probs / probs.sum()
+
+        # Mask invalid actions
+        probs = probs * action_mask
+        if probs.sum() > 0:
+            probs = probs / probs.sum()
+        else:
+            # Fallback
+            return 'c' if state.to_call > 0 else 'k'
+
+        action_idx = random.choices(range(self.NUM_ACTIONS), weights=probs)[0]
+
+        # Track action distribution
+        self.action_counts[action_idx] += 1
+        self.action_by_street[state.street][action_idx] += 1
+        self.total_decisions += 1
+
+        return self._convert_action_idx(action_idx, state)
+
+    def _encode_observation(self, hole_cards, board, action_history, client_pos, state) -> 'np.ndarray':
+        """
+        Encode game state as 50x4x13 tensor (matching C++ FastEnv encoding).
+        """
+        import numpy as np
+
+        obs = np.zeros((50, 4, 13), dtype=np.float32)
+
+        # Parse cards
+        rank_map = {'2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5,
+                    '8': 6, '9': 7, 'T': 8, 'J': 9, 'Q': 10, 'K': 11, 'A': 12}
+        suit_map = {'s': 0, 'h': 1, 'd': 2, 'c': 3}
+
+        def parse_card(c):
+            """Parse card string like 'As' -> (rank=12, suit=0)"""
+            return rank_map.get(c[0].upper(), 0), suit_map.get(c[1].lower(), 0)
+
+        all_cards = []
+
+        # [0-1] Hole cards
+        for i, card in enumerate(hole_cards[:2]):
+            rank, suit = parse_card(card)
+            obs[i, suit, rank] = 1.0
+            all_cards.append((rank, suit))
+
+        # [2-6] Board cards
+        for i, card in enumerate(board[:5]):
+            rank, suit = parse_card(card)
+            obs[2 + i, suit, rank] = 1.0
+            all_cards.append((rank, suit))
+
+        # [7] All known cards combined
+        for rank, suit in all_cards:
+            obs[7, suit, rank] = 1.0
+
+        # [8-11] Suit counts
+        suit_counts = [0, 0, 0, 0]
+        for rank, suit in all_cards:
+            suit_counts[suit] += 1
+        for s in range(4):
+            obs[8 + s, :, :] = suit_counts[s] / 7.0
+
+        # [12-15] Rank counts (pair/trips/quads indicators)
+        rank_counts = [0] * 13
+        for rank, suit in all_cards:
+            rank_counts[rank] += 1
+        for r in range(13):
+            count = rank_counts[r]
+            if count >= 1:
+                obs[12, :, r] = 1.0
+            if count >= 2:
+                obs[13, :, r] = 1.0
+            if count >= 3:
+                obs[14, :, r] = 1.0
+            if count >= 4:
+                obs[15, :, r] = 1.0
+
+        # [16-19] Street indicators
+        obs[16 + state.street, :, :] = 1.0
+
+        # [20-21] Position (hero is BTN or BB)
+        # client_pos: 0 = BB, 1 = SB/BTN
+        is_button = (client_pos == 1)
+        if is_button:
+            obs[20, :, :] = 1.0
+        else:
+            obs[21, :, :] = 1.0
+
+        # Convert from chips to BB (Slumbot uses 100 chips = 1bb)
+        pot_bb = state.pot / 100.0
+        to_call_bb = state.to_call / 100.0
+        my_stack_bb = state.my_stack / 100.0
+        opp_stack_bb = state.opp_stack / 100.0
+        starting_stack_bb = 200.0  # Slumbot uses 200bb stacks, same as training
+
+        # [22] To-call amount (normalized)
+        pot_for_odds = max(pot_bb, 1.0)
+        obs[22, :, :] = min(to_call_bb / pot_for_odds, 2.0) / 2.0
+
+        # [23] Facing all-in indicator
+        facing_allin = (opp_stack_bb < 0.01 and to_call_bb > 0)
+        obs[23, :, :] = 1.0 if facing_allin else 0.0
+
+        # [24-27] Stack/pot info (normalized by starting stack in BB)
+        obs[24, :, :] = my_stack_bb / starting_stack_bb
+        obs[25, :, :] = opp_stack_bb / starting_stack_bb
+
+        # SPR (Stack-to-Pot Ratio)
+        effective_stack_bb = min(my_stack_bb, opp_stack_bb)
+        spr = effective_stack_bb / max(pot_bb, 1.0)
+        obs[26, :, :] = min(spr / 10.0, 1.0)
+
+        # Pot as fraction of total chips
+        total_bb = pot_bb + my_stack_bb + opp_stack_bb
+        if total_bb > 0:
+            obs[27, :, :] = pot_bb / total_bb
+
+        # [28-49] Action history (simplified - just encode recent actions)
+        # Parse action string and encode last 22 actions
+        parsed_actions = self._parse_action_history(action_history)
+        for i, (action_type, amount, player, street_num) in enumerate(parsed_actions[-22:]):
+            channel = 28 + i
+            if channel >= 50:
+                break
+
+            # Row 0: action type
+            if action_type < 13:
+                obs[channel, 0, action_type] = 1.0
+
+            # Row 1: amount normalized (convert chips to BB)
+            amount_bb = amount / 100.0
+            obs[channel, 1, :] = min(amount_bb / starting_stack_bb, 1.0)
+
+            # Row 2: player indicator
+            # Convert to hero perspective
+            is_hero = (player == client_pos)
+            obs[channel, 2, :] = 1.0 if is_hero else 0.0
+
+            # Row 3: street
+            obs[channel, 3, :] = street_num / 3.0
+
+        return obs
+
+    def _encode_observation_38ch(self, hole_cards, board, action_history, client_pos, state) -> 'np.ndarray':
+        """
+        Encode game state as 38x4x13 tensor (legacy format for older checkpoints).
+
+        Channel layout:
+        [0-1]   : Hole cards (2 channels)
+        [2-6]   : Board cards (5 channels)
+        [7]     : All known cards combined
+        [8-11]  : Suit counts
+        [12-15] : Rank counts
+        [16-19] : Street indicators
+        [20-21] : Position indicators
+        [22]    : To-call amount
+        [23]    : Facing all-in
+        [24-27] : Pot/stack ratios
+        [28-37] : Betting history (10 actions)
+        """
+        import numpy as np
+
+        obs = np.zeros((38, 4, 13), dtype=np.float32)
+
+        # Parse cards
+        rank_map = {'2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5,
+                    '8': 6, '9': 7, 'T': 8, 'J': 9, 'Q': 10, 'K': 11, 'A': 12}
+        suit_map = {'s': 0, 'h': 1, 'd': 2, 'c': 3}
+
+        def parse_card(c):
+            return rank_map.get(c[0].upper(), 0), suit_map.get(c[1].lower(), 0)
+
+        all_cards = []
+
+        # [0-1] Hole cards
+        for i, card in enumerate(hole_cards[:2]):
+            rank, suit = parse_card(card)
+            obs[i, suit, rank] = 1.0
+            all_cards.append((rank, suit))
+
+        # [2-6] Board cards
+        for i, card in enumerate(board[:5]):
+            rank, suit = parse_card(card)
+            obs[2 + i, suit, rank] = 1.0
+            all_cards.append((rank, suit))
+
+        # [7] All known cards combined
+        for rank, suit in all_cards:
+            obs[7, suit, rank] = 1.0
+
+        # [8-11] Suit counts
+        suit_counts = [0, 0, 0, 0]
+        for rank, suit in all_cards:
+            suit_counts[suit] += 1
+        for s in range(4):
+            obs[8 + s, :, :] = suit_counts[s] / 7.0
+
+        # [12-15] Rank counts
+        rank_counts = [0] * 13
+        for rank, suit in all_cards:
+            rank_counts[rank] += 1
+        for r in range(13):
+            count = rank_counts[r]
+            if count >= 1:
+                obs[12, :, r] = 1.0
+            if count >= 2:
+                obs[13, :, r] = 1.0
+            if count >= 3:
+                obs[14, :, r] = 1.0
+            if count >= 4:
+                obs[15, :, r] = 1.0
+
+        # [16-19] Street indicators
+        obs[16 + state.street, :, :] = 1.0
+
+        # [20-21] Position
+        is_button = (client_pos == 1)
+        if is_button:
+            obs[20, :, :] = 1.0
+        else:
+            obs[21, :, :] = 1.0
+
+        # [22] To-call amount
+        pot = max(state.pot, 1.0)
+        obs[22, :, :] = min(state.to_call / pot, 2.0) / 2.0
+
+        # [23] Facing all-in
+        facing_allin = (state.opp_stack < 1 and state.to_call > 0)
+        obs[23, :, :] = 1.0 if facing_allin else 0.0
+
+        # [24-27] Stack/pot info
+        starting_stack = STACK_SIZE
+        obs[24, :, :] = state.my_stack / starting_stack
+        obs[25, :, :] = state.opp_stack / starting_stack
+
+        effective_stack = min(state.my_stack, state.opp_stack)
+        spr = effective_stack / max(pot, 1.0)
+        obs[26, :, :] = min(spr / 10.0, 1.0)
+
+        total_chips = state.pot + state.my_stack + state.opp_stack
+        if total_chips > 0:
+            obs[27, :, :] = state.pot / total_chips
+
+        # [28-37] Betting history (10 actions for legacy format)
+        parsed_actions = self._parse_action_history(action_history)
+        for i, (action_type, amount, player, street_num) in enumerate(parsed_actions[-10:]):
+            channel = 28 + i
+            if channel >= 38:
+                break
+            if action_type < 13:
+                obs[channel, 0, action_type] = 1.0
+            obs[channel, 1, :] = min(amount / starting_stack, 1.0)
+            is_hero = (player == client_pos)
+            obs[channel, 2, :] = 1.0 if is_hero else 0.0
+
+        return obs
+
+    def _parse_action_history(self, action: str) -> List[Tuple[int, float, int, int]]:
+        """Parse Slumbot action string to list of (action_type, amount, player, street)."""
+        # Action types: 0=fold, 1=check, 2=call, 3=bet, 4=raise, 5=all-in
+        actions = []
+        street = 0
+        current_player = 0  # SB acts first preflop
+
+        i = 0
+        while i < len(action):
+            c = action[i]
+
+            if c == '/':
+                street += 1
+                current_player = 1  # BB acts first postflop
+                i += 1
+            elif c == 'k':
+                actions.append((1, 0.0, current_player, street))  # check
+                current_player = 1 - current_player
+                i += 1
+            elif c == 'c':
+                actions.append((2, 0.0, current_player, street))  # call
+                current_player = 1 - current_player
+                i += 1
+            elif c == 'f':
+                actions.append((0, 0.0, current_player, street))  # fold
+                i += 1
+            elif c == 'b':
+                j = i + 1
+                while j < len(action) and action[j].isdigit():
+                    j += 1
+                amount = float(action[i+1:j]) if j > i + 1 else 0.0
+                # Check if this might be all-in
+                action_type = 4 if actions else 3  # raise if there was a bet, else bet
+                actions.append((action_type, amount, current_player, street))
+                current_player = 1 - current_player
+                i = j
+            else:
+                i += 1
+
+        return actions
+
+    def _get_action_mask(self, state) -> 'np.ndarray':
+        """Get valid action mask."""
+        import numpy as np
+
+        mask = np.zeros(self.NUM_ACTIONS, dtype=bool)
+
+        # Fold valid if facing a bet
+        mask[0] = state.to_call > 0
+
+        # Check/Call always valid
+        mask[1] = True
+
+        # Bet/raise sizes
+        pot = state.pot
+        for i, size in enumerate(self.BET_SIZES):
+            bet_amount = int(pot * size)
+            # Minimum raise check
+            min_raise = max(state.last_bet_size, BIG_BLIND)
+            if bet_amount >= min_raise and bet_amount <= state.my_stack:
+                mask[2 + i] = True
+
+        # All-in always valid if we have chips
+        mask[13] = state.my_stack > 0
+
+        return mask
+
+    def _convert_action_idx(self, action_idx: int, state) -> str:
+        """Convert action index to Slumbot format."""
+        if action_idx == 0:  # Fold
+            return 'f' if state.to_call > 0 else 'k'
+
+        elif action_idx == 1:  # Check/Call
+            return 'c' if state.to_call > 0 else 'k'
+
+        elif action_idx == 13:  # All-in
+            total_bet = state.my_stack + state.my_bet_this_street
+
+            # If our all-in doesn't exceed opponent's bet, it's just a call
+            if total_bet <= state.opp_bet_this_street:
+                return 'c' if state.to_call > 0 else 'k'
+
+            # If opponent is already all-in (can't raise), just call
+            if not state.can_raise or state.opp_stack == 0:
+                return 'c' if state.to_call > 0 else 'k'
+
+            # Check minimum raise requirement
+            min_raise_size = max(state.last_bet_size, BIG_BLIND)
+            min_total_bet = state.opp_bet_this_street + min_raise_size
+
+            # If we can't make a legal raise (not enough chips), just call
+            if total_bet < min_total_bet:
+                return 'c' if state.to_call > 0 else 'k'
+
+            return f'b{int(total_bet)}'
+
+        else:  # Bet/Raise (indices 2-12)
+            # If opponent is all-in or we can't raise, just call/check
+            if not state.can_raise or state.opp_stack == 0:
+                return 'c' if state.to_call > 0 else 'k'
+
+            size_idx = action_idx - 2
+            if size_idx < len(self.BET_SIZES):
+                pot_mult = self.BET_SIZES[size_idx]
+                bet_amount = int(state.pot * pot_mult)
+
+                # Minimum raise size (the INCREMENT, not total)
+                min_raise_size = max(state.last_bet_size, BIG_BLIND)
+
+                if state.to_call > 0:
+                    # Raising - minimum total bet is opponent's bet + min raise size
+                    min_total_bet = state.opp_bet_this_street + min_raise_size
+                    # Our desired bet = opponent's bet + our raise amount
+                    total_bet = state.opp_bet_this_street + max(bet_amount, min_raise_size)
+                else:
+                    # Betting (no prior bet) - minimum is BB
+                    min_total_bet = BIG_BLIND
+                    total_bet = max(bet_amount, BIG_BLIND)
+
+                # Cap at our maximum (stack + what we've already put in)
+                max_bet = state.my_stack + state.my_bet_this_street
+                total_bet = min(total_bet, max_bet)
+
+                # If we can't make a legal raise, just call/check
+                if total_bet < min_total_bet:
+                    return 'c' if state.to_call > 0 else 'k'
+
+                # If our bet doesn't exceed opponent's, just call/check
+                if total_bet <= state.opp_bet_this_street:
+                    return 'c' if state.to_call > 0 else 'k'
+
+                return f'b{int(total_bet)}'
+
+            return 'c' if state.to_call > 0 else 'k'
+
+    def print_action_distribution(self):
+        """Print summary of action distribution."""
+        if self.total_decisions == 0:
+            print("No decisions recorded yet.")
+            return
+
+        print("\n" + "=" * 60)
+        print("ACTION DISTRIBUTION ANALYSIS")
+        print("=" * 60)
+
+        # Overall distribution
+        print(f"\nTotal decisions: {self.total_decisions}")
+        print("\nOverall Action Distribution:")
+        print("-" * 40)
+
+        for i, name in enumerate(self.ACTION_NAMES):
+            count = self.action_counts[i]
+            pct = count / self.total_decisions * 100
+            bar = '#' * int(pct / 2)
+            print(f"  {name:12s}: {count:4d} ({pct:5.1f}%) {bar}")
+
+        # Group into categories
+        fold_pct = self.action_counts[0] / self.total_decisions * 100
+        check_call_pct = self.action_counts[1] / self.total_decisions * 100
+        small_bet_pct = sum(self.action_counts[2:6]) / self.total_decisions * 100  # 0.3x-0.9x
+        medium_bet_pct = sum(self.action_counts[6:9]) / self.total_decisions * 100  # 1.25x-2.5x
+        large_bet_pct = sum(self.action_counts[9:13]) / self.total_decisions * 100  # 3.5x+
+        allin_pct = self.action_counts[13] / self.total_decisions * 100
+
+        print("\nAction Categories:")
+        print("-" * 40)
+        print(f"  Fold:           {fold_pct:5.1f}%")
+        print(f"  Check/Call:     {check_call_pct:5.1f}%")
+        print(f"  Small bet:      {small_bet_pct:5.1f}%  (0.3x-0.9x pot)")
+        print(f"  Medium bet:     {medium_bet_pct:5.1f}%  (1.25x-2.5x pot)")
+        print(f"  Large bet:      {large_bet_pct:5.1f}%  (3.5x+ pot)")
+        print(f"  All-in:         {allin_pct:5.1f}%")
+
+        # Per-street breakdown
+        street_names = ['Preflop', 'Flop', 'Turn', 'River']
+        print("\nPer-Street Breakdown:")
+        print("-" * 40)
+
+        for s, street_name in enumerate(street_names):
+            street_total = sum(self.action_by_street[s])
+            if street_total == 0:
+                continue
+
+            print(f"\n  {street_name} ({street_total} decisions):")
+            fold = self.action_by_street[s][0] / street_total * 100
+            chk_call = self.action_by_street[s][1] / street_total * 100
+            bets = sum(self.action_by_street[s][2:13]) / street_total * 100
+            allin = self.action_by_street[s][13] / street_total * 100
+            print(f"    Fold: {fold:5.1f}%  Check/Call: {chk_call:5.1f}%  Bet/Raise: {bets:5.1f}%  All-in: {allin:5.1f}%")
+
+        print("=" * 60)
+
+
 def play_hand(client: SlumbotClient, agent: BaseAgent, verbose: bool = False) -> int:
     """Play a single hand against Slumbot. Returns winnings in chips."""
     r = client.new_hand()
@@ -749,8 +1378,23 @@ def play_hand(client: SlumbotClient, agent: BaseAgent, verbose: bool = False) ->
 
         if verbose:
             print(f"  Our action: {our_action}")
+            print(f"    State: pot={state.pot}, to_call={state.to_call}, "
+                  f"my_stack={state.my_stack}, opp_stack={state.opp_stack}, "
+                  f"my_bet={state.my_bet_this_street}, opp_bet={state.opp_bet_this_street}, "
+                  f"last_bet_size={state.last_bet_size}")
 
-        r = client.act(our_action)
+        try:
+            r = client.act(our_action)
+        except Exception as e:
+            if "Illegal bet" in str(e):
+                print(f"  ILLEGAL BET DEBUG:")
+                print(f"    Action history: {action}")
+                print(f"    Our action: {our_action}")
+                print(f"    State: pot={state.pot}, to_call={state.to_call}")
+                print(f"    my_stack={state.my_stack}, opp_stack={state.opp_stack}")
+                print(f"    my_bet={state.my_bet_this_street}, opp_bet={state.opp_bet_this_street}")
+                print(f"    last_bet_size={state.last_bet_size}, can_raise={state.can_raise}")
+            raise
 
 
 def run_benchmark(
@@ -826,6 +1470,10 @@ def run_benchmark(
     print(f"  Ruse: +194 mbb/hand")
     print(f"  Call-station: ~-500 mbb/hand")
 
+    # Print action distribution if agent supports it
+    if hasattr(agent, 'print_action_distribution'):
+        agent.print_action_distribution()
+
     return results
 
 
@@ -833,15 +1481,19 @@ def main():
     parser = argparse.ArgumentParser(description='Benchmark against Slumbot')
     parser.add_argument('--hands', type=int, default=100, help='Number of hands to play')
     parser.add_argument('--agent', type=str, default='ares',
-                        choices=['ares', 'call', 'random', 'heuristic', 'search'],
+                        choices=['ares', 'call', 'random', 'heuristic', 'search', 'neural'],
                         help='Agent to use')
     parser.add_argument('--strategy', type=str, default='blueprints/cpp_1M/strategy_1M.bin',
                         help='Path to ARES strategy file')
+    parser.add_argument('--checkpoint', type=str,
+                        help='Path to neural network checkpoint (for --agent neural)')
     parser.add_argument('--iterations', type=int, default=200,
                         help='CFR iterations for search agent (default: 200)')
     parser.add_argument('--username', type=str, help='Slumbot username for leaderboard')
     parser.add_argument('--password', type=str, help='Slumbot password')
     parser.add_argument('--verbose', action='store_true', help='Print each hand')
+    parser.add_argument('--device', type=str, default='cpu',
+                        help='Device for neural network (cpu/cuda/mps)')
 
     args = parser.parse_args()
 
@@ -850,7 +1502,12 @@ def main():
     print("=" * 60)
 
     # Create agent
-    if args.agent == 'ares':
+    if args.agent == 'neural':
+        if not args.checkpoint:
+            print("ERROR: --checkpoint required for neural agent")
+            sys.exit(1)
+        agent = NeuralNetworkAgent(args.checkpoint, device=args.device)
+    elif args.agent == 'ares':
         agent = ARESSolverAgent(args.strategy)
     elif args.agent == 'call':
         agent = CallStationAgent()

@@ -63,6 +63,9 @@ class TrainConfig:
     fc_num_layers: int = 4
     use_cnn: bool = True
 
+    # PPO hyperparameters
+    entropy_coef: float = 0.05  # Entropy bonus (higher = more exploration)
+
     # Checkpointing
     save_every: int = 50
     eval_every: int = 10
@@ -240,6 +243,7 @@ class VectorizedTrainerV2:
         print(f"Target timesteps: {self.config.total_timesteps:,}")
         print(f"Model parameters: {self.model.num_parameters:,}")
         print(f"Warmup phase: {self.config.warmup_self_play_updates} updates")
+        print(f"Entropy coefficient: {self.config.entropy_coef}")
 
         total_updates = self.config.total_timesteps // self.config.steps_per_update
         self.ppo.setup_scheduler(total_updates)
@@ -383,7 +387,7 @@ class VectorizedTrainerV2:
                 value_loss = 0.5 * ((values - returns) ** 2).mean()
                 entropy_loss = -entropy.mean()
 
-                loss = policy_loss + 0.5 * value_loss + 0.01 * entropy_loss
+                loss = policy_loss + 0.5 * value_loss + self.config.entropy_coef * entropy_loss
 
                 self.ppo.optimizer.zero_grad()
                 loss.backward()
@@ -616,6 +620,8 @@ def main():
     parser.add_argument('--checkpoint-dir', type=str, default='alphaholdem/checkpoints')
     parser.add_argument('--log-dir', type=str, default='alphaholdem/logs')
     parser.add_argument('--resume', type=str, default=None)
+    parser.add_argument('--entropy-coef', type=float, default=0.05,
+                        help='Entropy coefficient (higher = more exploration, default 0.05)')
     args = parser.parse_args()
 
     if args.device == 'auto':
@@ -629,7 +635,8 @@ def main():
         num_envs=args.num_envs,
         checkpoint_dir=args.checkpoint_dir,
         log_dir=args.log_dir,
-        device=device
+        device=device,
+        entropy_coef=args.entropy_coef
     )
 
     trainer = VectorizedTrainerV2(config)
