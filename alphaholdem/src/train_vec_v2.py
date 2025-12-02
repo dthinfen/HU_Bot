@@ -195,38 +195,67 @@ class KBestPool:
         self.k = k
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.initial_elo = initial_elo
-        self.k_factor = k_factor
         self.fc_hidden_dim = fc_hidden_dim
         self.fc_num_layers = fc_num_layers
         self.agents: List[Dict] = []
+        # Track performance of current agent vs each pool agent for PFSP
+        self.current_agent_bb_vs_pool: Dict[int, float] = {}
 
-    def add_agent(self, model: ActorCritic, elo: float, update_num: int, win_rate: float = 0.5):
+    def add_agent(self, model: ActorCritic, bb_per_100: float, update_num: int):
+        """Add agent to pool, ranked by bb/100."""
         path = self.checkpoint_dir / f"agent_{update_num}.pt"
         torch.save(model.state_dict(), path)
 
         self.agents.append({
             'path': str(path),
-            'elo': elo,
+            'bb_per_100': bb_per_100,  # Agent's bb/100 vs pool when added
             'update_num': update_num,
-            'win_rate': win_rate
         })
 
-        self.agents.sort(key=lambda x: x['elo'], reverse=True)
+        # Sort by bb/100 (best performers kept)
+        self.agents.sort(key=lambda x: x['bb_per_100'], reverse=True)
         if len(self.agents) > self.k:
             removed = self.agents.pop()
             if Path(removed['path']).exists():
                 Path(removed['path']).unlink()
-            print(f"  [POOL] Evicted agent_{removed['update_num']} (ELO={removed['elo']:.0f})")
+            # Also remove from PFSP tracking
+            if removed['update_num'] in self.current_agent_bb_vs_pool:
+                del self.current_agent_bb_vs_pool[removed['update_num']]
+            print(f"  [POOL] Evicted agent_{removed['update_num']} (bb/100={removed['bb_per_100']:+.1f})")
 
-    def sample_opponent(self, model_class: type, num_actions: int = 14) -> tuple:
+    def update_pfsp_stats(self, opponent_update_num: int, bb_per_100: float):
+        """Update PFSP stats: track how current agent does vs each opponent."""
+        self.current_agent_bb_vs_pool[opponent_update_num] = bb_per_100
+
+    def sample_opponent_pfsp(self, model_class: type, num_actions: int = 14) -> tuple:
+        """
+        Prioritized Fictitious Self-Play opponent selection.
+        Sample opponents proportionally to how much they exploit us.
+        Opponents we lose to get higher priority.
+        """
         if not self.agents:
             return None, None
 
-        # Weighted sampling by ELO (prefer stronger opponents)
-        elos = np.array([a['elo'] for a in self.agents])
-        weights = np.exp((elos - elos.min()) / 100)  # Softmax-ish
-        weights /= weights.sum()
+        # Calculate priority for each agent
+        # Priority = f(1 - win_prob), where win_prob approximated from bb/100
+        # Agents we lose to (negative bb/100 against) get higher priority
+        priorities = []
+        for agent in self.agents:
+            update_num = agent['update_num']
+            if update_num in self.current_agent_bb_vs_pool:
+                bb = self.current_agent_bb_vs_pool[update_num]
+                # Higher priority for opponents we lose to
+                # Use (1 - sigmoid(bb/20))^2 so losing matchups get much higher weight
+                win_prob = 1 / (1 + math.exp(-bb / 20))
+                priority = (1 - win_prob) ** 2 + 0.1  # +0.1 ensures all agents have some chance
+            else:
+                # Unknown matchup - give medium priority
+                priority = 0.5
+            priorities.append(priority)
+
+        # Normalize to probability distribution
+        priorities = np.array(priorities)
+        weights = priorities / priorities.sum()
 
         idx = np.random.choice(len(self.agents), p=weights)
         agent_info = self.agents[idx]
@@ -241,6 +270,10 @@ class KBestPool:
         opponent.load_state_dict(torch.load(agent_info['path'], map_location='cpu'))
         opponent.eval()
         return opponent, agent_info
+
+    def sample_opponent(self, model_class: type, num_actions: int = 14) -> tuple:
+        """Alias for PFSP sampling."""
+        return self.sample_opponent_pfsp(model_class, num_actions)
 
     def get_agent_by_idx(self, idx: int, model_class: type, num_actions: int = 14) -> Optional[ActorCritic]:
         if idx >= len(self.agents):
@@ -260,8 +293,8 @@ class KBestPool:
     def get_pool_stats(self) -> str:
         if not self.agents:
             return "Pool empty"
-        elos = [a['elo'] for a in self.agents]
-        return f"Pool({len(self.agents)}): ELO [{min(elos):.0f}-{max(elos):.0f}], avg={np.mean(elos):.0f}"
+        bb_rates = [a['bb_per_100'] for a in self.agents]
+        return f"Pool({len(self.agents)}): bb/100 [{min(bb_rates):+.1f} to {max(bb_rates):+.1f}], avg={np.mean(bb_rates):+.1f}"
 
 
 class VectorizedTrainerV2:
@@ -343,7 +376,7 @@ class VectorizedTrainerV2:
         self.update_count = 0
         self.episode_rewards: deque = deque(maxlen=5000)  # Smaller window
         self.opponent: Optional[ActorCritic] = None
-        self._current_opp_elo = None
+        self._current_opp_id = None  # Track current opponent for logging
 
         # Warmup tracking
         self.warmup_model: Optional[ActorCritic] = None
@@ -406,7 +439,7 @@ class VectorizedTrainerV2:
                     # Set batched opponent policy (works with both Python and C++ V2 env)
                     self.vec_env.set_opponent(self._batched_opponent_policy)
                     self.in_warmup = False
-                    self._current_opp_elo = self.config.initial_elo
+                    self._current_opp_id = "self"
 
             # Update opponent
             if not self.in_warmup and self.update_count % self.config.update_opponent_every == 0:
@@ -599,39 +632,41 @@ class VectorizedTrainerV2:
             return actions.cpu().numpy().astype(np.int32)
 
     def _update_opponent(self):
-        """Update opponent from pool or use self-play."""
+        """Update opponent from pool using PFSP or use self-play."""
         if len(self.opponent_pool.agents) == 0:
             # Self-play against current snapshot
             if self.warmup_model is not None:
                 self.opponent = self.warmup_model
-                self._current_opp_elo = self.config.initial_elo
+                self._current_opp_id = "self"
         else:
             opponent, agent_info = self.opponent_pool.sample_opponent(ActorCritic, self.config.num_actions)
             if opponent is not None:
-                self.opponent = opponent.to(self.device)
-                self.opponent.eval()
-                self._current_opp_elo = agent_info['elo']
-                self.vec_env.set_opponent(self._batched_opponent_policy)
-                print(f"  [OPPONENT] Switched to agent_{agent_info['update_num']} (ELO={agent_info['elo']:.0f})")
+                new_opp_id = agent_info['update_num']
+                # Only print if actually switching to different opponent
+                if new_opp_id != self._current_opp_id:
+                    self.opponent = opponent.to(self.device)
+                    self.opponent.eval()
+                    self._current_opp_id = new_opp_id
+                    self.vec_env.set_opponent(self._batched_opponent_policy)
+                    print(f"  [OPPONENT] Switched to agent_{new_opp_id} (bb/100={agent_info['bb_per_100']:+.1f})")
 
     def _evaluate_for_pool(self):
         """Evaluate and potentially add to pool."""
         if len(self.opponent_pool.agents) == 0:
-            # First agent - add with initial ELO
-            self.opponent_pool.add_agent(self.model, self.config.initial_elo, self.update_count)
+            # First agent - add with bb/100 of 0 (baseline)
+            self.opponent_pool.add_agent(self.model, 0.0, self.update_count)
             print(f"  [POOL] Added first agent_{self.update_count}")
         else:
-            new_elo, bb_per_100, results = self._evaluate_against_pool()
-            self.opponent_pool.add_agent(self.model, new_elo, self.update_count, bb_per_100)
-            print(f"  [POOL] Agent_{self.update_count}: ELO={new_elo:.0f}, bb/100={bb_per_100:+.1f}")
+            bb_per_100, results = self._evaluate_against_pool()
+            self.opponent_pool.add_agent(self.model, bb_per_100, self.update_count)
+            print(f"  [POOL] Agent_{self.update_count}: bb/100={bb_per_100:+.1f} vs pool")
             print(f"  [POOL] {self.opponent_pool.get_pool_stats()}")
 
     def _evaluate_against_pool(self) -> tuple:
-        """Evaluate against pool using profit (bb/100) for ELO updates."""
+        """Evaluate against pool using profit (bb/100). Updates PFSP stats."""
         if len(self.opponent_pool.agents) == 0:
-            return self.config.initial_elo, 0.0, []
+            return 0.0, []
 
-        new_elo = self.config.initial_elo
         total_profit = 0.0
         total_games = 0
         results = []
@@ -678,31 +713,23 @@ class VectorizedTrainerV2:
             total_profit += matchup_profit
             total_games += games
 
-            # ELO update based on profit
-            # Convert bb/100 to a score: positive profit = win, negative = loss
-            # Use sigmoid to map profit to [0, 1] range
-            # bb/100 of +10 -> ~0.73, bb/100 of -10 -> ~0.27, 0 -> 0.5
+            # Calculate bb/100 for this matchup
             bb_per_100 = (matchup_profit / games) * 100
-            # Sigmoid with scaling: score = 1 / (1 + exp(-bb/100 / 20))
-            # This maps: +20 bb/100 -> 0.73, -20 bb/100 -> 0.27, 0 -> 0.5
-            score = 1 / (1 + math.exp(-bb_per_100 / 20))
 
-            opponent_elo = agent_info['elo']
-            expected = 1 / (1 + 10 ** ((opponent_elo - new_elo) / 400))
-            new_elo += self.config.elo_k_factor * (score - expected)
+            # Update PFSP stats for opponent selection
+            self.opponent_pool.update_pfsp_stats(agent_info['update_num'], bb_per_100)
 
             results.append({
                 'opponent': agent_info['update_num'],
                 'games': games,
                 'profit': matchup_profit,
                 'bb_per_100': bb_per_100,
-                'score': score
             })
-            print(f"    vs agent_{agent_info['update_num']}: bb/100={bb_per_100:+.1f}, score={score:.2f}")
+            print(f"    vs agent_{agent_info['update_num']}: bb/100={bb_per_100:+.1f}")
 
         self.model.train()
         overall_bb_per_100 = (total_profit / total_games) * 100 if total_games > 0 else 0.0
-        return new_elo, overall_bb_per_100, results
+        return overall_bb_per_100, results
 
     def _eval_opponent_policy(self, obs: np.ndarray, action_mask: np.ndarray) -> int:
         """Opponent policy for evaluation - stochastic."""
@@ -764,7 +791,7 @@ class VectorizedTrainerV2:
         elif self.opponent is None:
             phase_str = "vs RANDOM"
         else:
-            phase_str = f"vs ELO {self._current_opp_elo:.0f}" if self._current_opp_elo else "vs SELF"
+            phase_str = f"vs agent_{self._current_opp_id}" if self._current_opp_id else "vs SELF"
 
         pool_str = f" | {self.opponent_pool.get_pool_stats()}" if len(self.opponent_pool.agents) > 0 else ""
 
