@@ -103,30 +103,38 @@ class CppVecEnvV2Wrapper:
         return obs, masks, reset_mask
 
     def step(self, hero_actions):
-        """Step with batched opponent inference."""
+        """Step with batched opponent inference using two-phase approach."""
         hero_actions = hero_actions.astype(np.int32)
 
         if not self._use_nn_opponent:
             # Random opponent - let C++ handle it
             obs, masks, rewards, dones = self._env.step(hero_actions, None)
         else:
-            # NN opponent - get opponent obs and do batched inference
+            # Two-phase stepping for proper NN opponent:
+            # Phase 1: Apply hero actions, get which envs need opponent
+            rewards, dones, needs_opponent = self._env.step_hero(hero_actions)
+
+            # Phase 2: Get opponent observations AFTER hero has acted
             opp_obs, opp_masks, env_indices, count = self._env.get_opponent_obs()
 
             if count > 0:
-                # Batch inference for opponent
-                opp_actions = np.zeros(self.num_envs, dtype=np.int32)
+                # Batch inference for opponent on CORRECT game state
                 opp_actions_batch = self._opponent_policy(
                     opp_obs[:count],
                     opp_masks[:count]
                 )
-                # Scatter back to full array
-                for j in range(count):
-                    opp_actions[env_indices[j]] = opp_actions_batch[j]
 
-                obs, masks, rewards, dones = self._env.step(hero_actions, opp_actions)
-            else:
-                obs, masks, rewards, dones = self._env.step(hero_actions, None)
+                # Apply opponent actions
+                self._env.step_opponent(
+                    opp_actions_batch.astype(np.int32),
+                    env_indices[:count].astype(np.int32),
+                    count,
+                    rewards,
+                    dones
+                )
+
+            # Get final observations
+            obs, masks = self._env.get_obs_and_masks()
 
         self.dones = dones
         infos = [{}] * self.num_envs
