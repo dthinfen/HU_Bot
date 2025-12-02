@@ -13,6 +13,7 @@ import numpy as np
 import time
 import argparse
 import gc
+import math
 from datetime import datetime
 from typing import Optional, List, Dict
 from dataclasses import dataclass, asdict
@@ -620,18 +621,18 @@ class VectorizedTrainerV2:
             self.opponent_pool.add_agent(self.model, self.config.initial_elo, self.update_count)
             print(f"  [POOL] Added first agent_{self.update_count}")
         else:
-            new_elo, win_rate, results = self._evaluate_against_pool()
-            self.opponent_pool.add_agent(self.model, new_elo, self.update_count, win_rate)
-            print(f"  [POOL] Agent_{self.update_count}: ELO={new_elo:.0f}, win_rate={win_rate:.1%}")
+            new_elo, bb_per_100, results = self._evaluate_against_pool()
+            self.opponent_pool.add_agent(self.model, new_elo, self.update_count, bb_per_100)
+            print(f"  [POOL] Agent_{self.update_count}: ELO={new_elo:.0f}, bb/100={bb_per_100:+.1f}")
             print(f"  [POOL] {self.opponent_pool.get_pool_stats()}")
 
     def _evaluate_against_pool(self) -> tuple:
-        """Evaluate with proper win counting."""
+        """Evaluate against pool using profit (bb/100) for ELO updates."""
         if len(self.opponent_pool.agents) == 0:
-            return self.config.initial_elo, 0.5, []
+            return self.config.initial_elo, 0.0, []
 
         new_elo = self.config.initial_elo
-        total_wins = 0
+        total_profit = 0.0
         total_games = 0
         results = []
         self.model.eval()
@@ -647,9 +648,7 @@ class VectorizedTrainerV2:
             old_opponent = self.opponent
             self.opponent = opponent
 
-            wins = 0
-            losses = 0
-            draws = 0
+            matchup_profit = 0.0
             games = self.config.elo_games_per_matchup
 
             for game_idx in range(games):
@@ -673,39 +672,37 @@ class VectorizedTrainerV2:
 
                 # Get final payoff from terminal state
                 game_reward = self.eval_env.state.get_payoff(0)
-
-                # Win/loss counting (use small epsilon for floating point)
-                if game_reward > 0.01:  # Win
-                    wins += 1
-                elif game_reward < -0.01:  # Loss
-                    losses += 1
-                else:  # Draw (chopped pot, etc.)
-                    draws += 1
+                matchup_profit += game_reward
 
             self.opponent = old_opponent
-            total_wins += wins
+            total_profit += matchup_profit
             total_games += games
 
-            # ELO update with draws counted as 0.5
+            # ELO update based on profit
+            # Convert bb/100 to a score: positive profit = win, negative = loss
+            # Use sigmoid to map profit to [0, 1] range
+            # bb/100 of +10 -> ~0.73, bb/100 of -10 -> ~0.27, 0 -> 0.5
+            bb_per_100 = (matchup_profit / games) * 100
+            # Sigmoid with scaling: score = 1 / (1 + exp(-bb/100 / 20))
+            # This maps: +20 bb/100 -> 0.73, -20 bb/100 -> 0.27, 0 -> 0.5
+            score = 1 / (1 + math.exp(-bb_per_100 / 20))
+
             opponent_elo = agent_info['elo']
-            score = (wins + 0.5 * draws) / games
             expected = 1 / (1 + 10 ** ((opponent_elo - new_elo) / 400))
-            new_elo += self.config.elo_k_factor * games * (score - expected)
+            new_elo += self.config.elo_k_factor * (score - expected)
 
             results.append({
                 'opponent': agent_info['update_num'],
                 'games': games,
-                'wins': wins,
-                'draws': draws,
-                'losses': losses,
+                'profit': matchup_profit,
+                'bb_per_100': bb_per_100,
                 'score': score
             })
-            # Debug: print matchup details
-            print(f"    vs agent_{agent_info['update_num']}: W={wins} D={draws} L={losses} score={score:.2f}")
+            print(f"    vs agent_{agent_info['update_num']}: bb/100={bb_per_100:+.1f}, score={score:.2f}")
 
         self.model.train()
-        win_rate = total_wins / total_games if total_games > 0 else 0.5
-        return new_elo, win_rate, results
+        overall_bb_per_100 = (total_profit / total_games) * 100 if total_games > 0 else 0.0
+        return new_elo, overall_bb_per_100, results
 
     def _eval_opponent_policy(self, obs: np.ndarray, action_mask: np.ndarray) -> int:
         """Opponent policy for evaluation - stochastic."""
