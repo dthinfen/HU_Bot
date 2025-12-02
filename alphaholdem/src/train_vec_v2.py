@@ -457,6 +457,9 @@ class VectorizedTrainerV2:
                 probs = probs * 0.99 + 0.01 / self.config.num_actions
                 # Re-apply mask to zero out invalid actions after adding noise
                 probs = probs * mask_tensor.float()
+                # Renormalize with epsilon to avoid numerical issues
+                probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
+                probs = probs.clamp(min=1e-8)
                 probs = probs / probs.sum(dim=-1, keepdim=True)
 
                 dist = torch.distributions.Categorical(probs)
@@ -547,6 +550,8 @@ class VectorizedTrainerV2:
             probs = probs * 0.95 + 0.05 / self.config.num_actions
             # Re-apply mask to zero out invalid actions after adding noise
             probs = probs * mask_tensor.float()
+            probs = probs / (probs.sum() + 1e-8)
+            probs = probs.clamp(min=1e-8)
             probs = probs / probs.sum()
 
             dist = torch.distributions.Categorical(probs)
