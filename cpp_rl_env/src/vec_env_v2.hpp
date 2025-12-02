@@ -221,6 +221,39 @@ public:
         }
     }
 
+    // Reset only done environments
+    void reset_done_envs(float* obs_out, float* masks_out, bool* reset_mask_out) {
+        for (int i = 0; i < num_envs_; i++) {
+            bool needs_reset = dones_[i] || states_[i].is_terminal();
+
+            // Safety: also reset if no valid actions
+            if (!needs_reset) {
+                auto mask = get_action_mask(i, 0);
+                bool any_valid = false;
+                for (int j = 0; j < NUM_ACTIONS; j++) {
+                    if (mask[j] > 0) { any_valid = true; break; }
+                }
+                if (!any_valid) needs_reset = true;
+            }
+
+            reset_mask_out[i] = needs_reset;
+
+            if (needs_reset) {
+                reset_env(i);
+
+                // Let opponent act first if needed
+                while (!states_[i].is_terminal() && states_[i].current_player == 1) {
+                    int opp_action = random_action(i, 1);
+                    apply_action(i, opp_action, 1);
+                    maybe_advance_street(i);
+                }
+            }
+
+            encode_hero_obs(i, obs_out + i * OBS_SIZE);
+            get_hero_mask(i, masks_out + i * NUM_ACTIONS);
+        }
+    }
+
 private:
     void reset_env(int i) {
         decks_[i].shuffle(rng_);

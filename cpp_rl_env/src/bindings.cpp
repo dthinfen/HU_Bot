@@ -194,6 +194,18 @@ public:
         return std::make_tuple(obs, masks);
     }
 
+    // Reset only done environments
+    std::tuple<py::array_t<float>, py::array_t<float>, py::array_t<bool>>
+    reset_done_envs() {
+        auto obs = py::array_t<float>({num_envs_, 50, 4, 13});
+        auto masks = py::array_t<float>({num_envs_, 14});
+        auto reset_mask = py::array_t<bool>(num_envs_);
+
+        env_.reset_done_envs(obs.mutable_data(), masks.mutable_data(), reset_mask.mutable_data());
+
+        return std::make_tuple(obs, masks, reset_mask);
+    }
+
 private:
     VectorizedEnvV2 env_;
     int num_envs_;
@@ -236,7 +248,8 @@ PYBIND11_MODULE(cpp_vec_env, m) {
         .def("get_opponent_obs", &PyVectorizedEnvV2::get_opponent_obs)
         .def("step_hero", &PyVectorizedEnvV2::step_hero)
         .def("step_opponent", &PyVectorizedEnvV2::step_opponent)
-        .def("get_obs_and_masks", &PyVectorizedEnvV2::get_obs_and_masks);
+        .def("get_obs_and_masks", &PyVectorizedEnvV2::get_obs_and_masks)
+        .def("reset_done_envs", &PyVectorizedEnvV2::reset_done_envs);
 
     // Constants
     m.attr("OBS_SHAPE") = py::make_tuple(50, 4, 13);

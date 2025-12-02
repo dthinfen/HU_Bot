@@ -95,12 +95,9 @@ class CppVecEnvV2Wrapper:
         return obs, masks
 
     def reset_done_envs(self):
-        # Reset done envs and get initial state
-        obs, masks = self._env.reset()  # V2 doesn't have reset_done_envs, use full reset
-        # Actually need to handle this differently - step will auto-reset done envs
-        obs, masks = self._env.get_obs_and_masks()
-        reset_mask = self.dones.copy()
-        self.dones[:] = False
+        # Use proper reset_done_envs from C++ env
+        obs, masks, reset_mask = self._env.reset_done_envs()
+        self.dones[reset_mask] = False
         return obs, masks, reset_mask
 
     def step(self, hero_actions):
