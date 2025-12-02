@@ -772,6 +772,21 @@ class VectorizedTrainerV2:
         self.update_count = checkpoint.get('update_count', 0)
         self.total_timesteps = checkpoint.get('total_timesteps', 0)
         self.total_hands = checkpoint.get('total_hands', 0)
+
+        # If resuming past warmup, setup self-play opponent
+        if self.update_count >= self.config.warmup_self_play_updates:
+            self.in_warmup = False
+            self.warmup_model = ActorCritic(
+                input_channels=50, use_cnn=True, num_actions=self.config.num_actions,
+                fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
+            ).to(self.device)
+            self.warmup_model.load_state_dict(self.model.state_dict())
+            self.warmup_model.eval()
+            self.opponent = self.warmup_model
+            self._current_opp_id = "self"
+            self.vec_env.set_opponent(self._batched_opponent_policy)
+            print(f"  Resuming in self-play mode")
+
         print(f"Loaded: update={self.update_count}, steps={self.total_timesteps:,}")
 
     def _log_progress(self, stats: Dict, start_time: float):
