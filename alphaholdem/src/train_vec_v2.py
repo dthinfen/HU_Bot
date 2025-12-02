@@ -32,6 +32,46 @@ from alphaholdem.src.ppo import PPO, PPOConfig
 from alphaholdem.src.vec_env import VectorizedHeadsUpEnv, VectorizedRolloutBuffer
 from alphaholdem.src.encoder import AlphaHoldemEncoder
 
+# Try to import C++ vectorized environment
+try:
+    import cpp_vec_env
+    HAS_CPP_ENV = True
+except ImportError:
+    HAS_CPP_ENV = False
+    cpp_vec_env = None
+
+
+class CppVecEnvWrapper:
+    """Wrapper for C++ vectorized environment to match Python API."""
+
+    def __init__(self, num_envs: int, starting_stack: float, num_actions: int):
+        self.num_envs = num_envs
+        self.num_actions = num_actions
+        self._env = cpp_vec_env.VectorizedEnv(num_envs, starting_stack)
+        self.dones = np.zeros(num_envs, dtype=bool)
+
+    def set_opponent(self, policy):
+        # C++ env only supports random opponents
+        # For self-play, the Python env should be used instead
+        pass
+
+    def reset(self):
+        obs, masks = self._env.reset()
+        self.dones[:] = False
+        return obs, masks
+
+    def reset_done_envs(self):
+        obs, masks, reset_mask = self._env.reset_done_envs()
+        self.dones[reset_mask] = False
+        return obs, masks, reset_mask
+
+    def step(self, actions):
+        obs, masks, rewards, dones = self._env.step(actions.astype(np.int32))
+        self.dones = dones
+        # Return format matching Python env: (obs, masks, rewards, dones, infos)
+        infos = [{}] * self.num_envs
+        return obs, masks, rewards, dones, infos
+
 
 @dataclass
 class TrainConfig:
@@ -73,6 +113,9 @@ class TrainConfig:
 
     # Memory management
     gc_every: int = 10  # Run garbage collection every N updates
+
+    # C++ environment (10-100x faster)
+    use_cpp_env: bool = False
 
     # Paths
     checkpoint_dir: str = "alphaholdem/checkpoints"
@@ -204,11 +247,26 @@ class VectorizedTrainerV2:
         )
 
         # Vectorized environment
-        self.vec_env = VectorizedHeadsUpEnv(
-            config.num_envs,
-            config.starting_stack,
-            config.num_actions
-        )
+        self.use_cpp_env = config.use_cpp_env and HAS_CPP_ENV
+        if self.use_cpp_env:
+            self.vec_env = CppVecEnvWrapper(
+                config.num_envs,
+                config.starting_stack,
+                config.num_actions
+            )
+            # Keep Python env for self-play after warmup
+            self.py_vec_env = VectorizedHeadsUpEnv(
+                config.num_envs,
+                config.starting_stack,
+                config.num_actions
+            )
+        else:
+            self.vec_env = VectorizedHeadsUpEnv(
+                config.num_envs,
+                config.starting_stack,
+                config.num_actions
+            )
+            self.py_vec_env = None
 
         # Single env for evaluation
         from alphaholdem.src.env import HeadsUpEnv
@@ -244,6 +302,7 @@ class VectorizedTrainerV2:
         print(f"Model parameters: {self.model.num_parameters:,}")
         print(f"Warmup phase: {self.config.warmup_self_play_updates} updates")
         print(f"Entropy coefficient: {self.config.entropy_coef}")
+        print(f"Using C++ env: {self.use_cpp_env} (available: {HAS_CPP_ENV})")
 
         total_updates = self.config.total_timesteps // self.config.steps_per_update
         self.ppo.setup_scheduler(total_updates)
@@ -280,6 +339,13 @@ class VectorizedTrainerV2:
                 if self.update_count >= self.config.warmup_self_play_updates:
                     # End warmup, save warmup model for self-play
                     print(f"  [WARMUP] Completed warmup phase, switching to self-play")
+
+                    # Switch from C++ to Python env for self-play (C++ doesn't support NN opponents)
+                    if self.use_cpp_env and self.py_vec_env is not None:
+                        print(f"  [ENV] Switching from C++ to Python env for self-play")
+                        self.vec_env = self.py_vec_env
+                        obs, action_masks = self.vec_env.reset()
+
                     self.warmup_model = ActorCritic(
                         input_channels=50, use_cnn=True, num_actions=self.config.num_actions,
                         fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
@@ -624,6 +690,8 @@ def main():
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--entropy-coef', type=float, default=0.05,
                         help='Entropy coefficient (higher = more exploration, default 0.05)')
+    parser.add_argument('--use-cpp-env', action='store_true',
+                        help='Use C++ environment for 10-100x faster warmup (auto-switches to Python for self-play)')
     args = parser.parse_args()
 
     if args.device == 'auto':
@@ -638,7 +706,8 @@ def main():
         checkpoint_dir=args.checkpoint_dir,
         log_dir=args.log_dir,
         device=device,
-        entropy_coef=args.entropy_coef
+        entropy_coef=args.entropy_coef,
+        use_cpp_env=args.use_cpp_env
     )
 
     trainer = VectorizedTrainerV2(config)
