@@ -656,26 +656,25 @@ class VectorizedTrainerV2:
                 self.eval_env.reset()
                 self.eval_env.set_opponent(self._eval_opponent_policy)
                 done = False
-                game_reward = 0
 
                 while not done:
                     if self.eval_env.state.is_terminal():
-                        game_reward = self.eval_env.state.get_payoff(0)
                         break
                     obs = self._get_eval_obs()
                     action_mask = self.eval_env.get_action_mask()
                     with torch.no_grad():
                         obs_t = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
                         mask_t = torch.tensor(action_mask, dtype=torch.bool, device=self.device).unsqueeze(0)
-                        # Use stochastic for evaluation too
                         logits, _ = self.model(obs_t, mask_t)
                         probs = torch.softmax(logits, dim=-1)
                         dist = torch.distributions.Categorical(probs)
                         action = dist.sample()
                     _, reward, done, _ = self.eval_env.step(action.item())
-                    game_reward += reward
 
-                # Better win/loss counting
+                # Get final payoff from terminal state
+                game_reward = self.eval_env.state.get_payoff(0)
+
+                # Win/loss counting
                 if game_reward > 0.5:  # Clear win
                     wins += 1
                 elif game_reward < -0.5:  # Clear loss
