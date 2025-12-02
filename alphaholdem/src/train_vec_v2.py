@@ -541,24 +541,35 @@ class VectorizedTrainerV2:
                 obs = batch['observations']
                 actions = batch['actions']
                 old_log_probs = batch['old_log_probs']
+                old_values = batch['old_values']
                 advantages = batch['advantages']
                 returns = batch['returns']
                 action_masks = batch['action_masks']
 
                 new_log_probs, values, entropy = self.model.evaluate_actions(obs, actions, action_masks)
 
+                # Policy loss with clipping
                 ratio = torch.exp(new_log_probs - old_log_probs)
                 clipped_ratio = torch.clamp(ratio, 1 - self.ppo.config.clip_ratio, 1 + self.ppo.config.clip_ratio)
                 policy_loss = torch.max(-advantages * ratio, -advantages * clipped_ratio).mean()
 
-                value_loss = 0.5 * ((values - returns) ** 2).mean()
+                # Value loss with clipping
+                value_clipped = old_values + torch.clamp(
+                    values - old_values,
+                    -self.ppo.config.clip_ratio,
+                    self.ppo.config.clip_ratio
+                )
+                value_loss1 = (values - returns) ** 2
+                value_loss2 = (value_clipped - returns) ** 2
+                value_loss = 0.5 * torch.max(value_loss1, value_loss2).mean()
+
                 entropy_loss = -entropy.mean()
 
                 loss = policy_loss + 0.5 * value_loss + self.config.entropy_coef * entropy_loss
 
                 self.ppo.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.ppo.config.max_grad_norm)
                 self.ppo.optimizer.step()
 
                 total_policy_loss += policy_loss.item()
@@ -623,11 +634,8 @@ class VectorizedTrainerV2:
 
             # Small exploration noise
             probs = probs * 0.95 + 0.05 / self.config.num_actions
-            # Re-apply mask
+            # Re-apply mask and renormalize
             probs = probs * mask_tensor.float()
-            # Renormalize (add eps to avoid div by zero)
-            probs = probs / (probs.sum(dim=-1, keepdim=True) + 1e-8)
-            # Clamp to valid range for Categorical
             probs = probs.clamp(min=1e-8)
             probs = probs / probs.sum(dim=-1, keepdim=True)
 
