@@ -841,8 +841,8 @@ def main():
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--entropy-coef', type=float, default=0.01,
                         help='Entropy coefficient (default 0.01, AlphaHoldem paper)')
-    parser.add_argument('--use-cpp-env', action='store_true',
-                        help='Use C++ environment for 10-100x faster warmup (auto-switches to Python for self-play)')
+    parser.add_argument('--no-cpp-env', action='store_true',
+                        help='Disable C++ environment (use slower Python env)')
     args = parser.parse_args()
 
     if args.device == 'auto':
@@ -858,7 +858,7 @@ def main():
         log_dir=args.log_dir,
         device=device,
         entropy_coef=args.entropy_coef,
-        use_cpp_env=args.use_cpp_env
+        use_cpp_env=not args.no_cpp_env
     )
 
     trainer = VectorizedTrainerV2(config)
