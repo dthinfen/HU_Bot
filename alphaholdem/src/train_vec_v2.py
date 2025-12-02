@@ -152,7 +152,7 @@ class TrainConfig:
     eval_for_pool_every: int = 25  # More frequent pool evaluation
     min_updates_for_pool: int = 100  # Wait for 100 updates before first pool agent
     warmup_self_play_updates: int = 50  # Self-play warmup before pool
-    eval_games_per_matchup: int = 50000  # Games per matchup for bb/100 estimation (SE ~±3 bb/100)
+    eval_games_per_matchup: int = 5000  # Games per matchup for bb/100 estimation (SE ~±10 bb/100)
 
     # Network
     hidden_dim: int = 256
