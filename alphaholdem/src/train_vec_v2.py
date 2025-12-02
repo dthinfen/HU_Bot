@@ -73,6 +73,67 @@ class CppVecEnvWrapper:
         return obs, masks, rewards, dones, infos
 
 
+class CppVecEnvV2Wrapper:
+    """V2 wrapper with batched opponent inference support for self-play."""
+
+    def __init__(self, num_envs: int, starting_stack: float, num_actions: int):
+        self.num_envs = num_envs
+        self.num_actions = num_actions
+        self._env = cpp_vec_env.VectorizedEnvV2(num_envs, starting_stack)
+        self.dones = np.zeros(num_envs, dtype=bool)
+        self._opponent_policy = None
+        self._use_nn_opponent = False
+
+    def set_opponent(self, policy):
+        """Set opponent policy for batched inference."""
+        self._opponent_policy = policy
+        self._use_nn_opponent = policy is not None
+
+    def reset(self):
+        obs, masks = self._env.reset()
+        self.dones[:] = False
+        return obs, masks
+
+    def reset_done_envs(self):
+        # Reset done envs and get initial state
+        obs, masks = self._env.reset()  # V2 doesn't have reset_done_envs, use full reset
+        # Actually need to handle this differently - step will auto-reset done envs
+        obs, masks = self._env.get_obs_and_masks()
+        reset_mask = self.dones.copy()
+        self.dones[:] = False
+        return obs, masks, reset_mask
+
+    def step(self, hero_actions):
+        """Step with batched opponent inference."""
+        hero_actions = hero_actions.astype(np.int32)
+
+        if not self._use_nn_opponent:
+            # Random opponent - let C++ handle it
+            obs, masks, rewards, dones = self._env.step(hero_actions, None)
+        else:
+            # NN opponent - get opponent obs and do batched inference
+            opp_obs, opp_masks, env_indices, count = self._env.get_opponent_obs()
+
+            if count > 0:
+                # Batch inference for opponent
+                opp_actions = np.zeros(self.num_envs, dtype=np.int32)
+                opp_actions_batch = self._opponent_policy(
+                    opp_obs[:count],
+                    opp_masks[:count]
+                )
+                # Scatter back to full array
+                for j in range(count):
+                    opp_actions[env_indices[j]] = opp_actions_batch[j]
+
+                obs, masks, rewards, dones = self._env.step(hero_actions, opp_actions)
+            else:
+                obs, masks, rewards, dones = self._env.step(hero_actions, None)
+
+        self.dones = dones
+        infos = [{}] * self.num_envs
+        return obs, masks, rewards, dones, infos
+
+
 @dataclass
 class TrainConfig:
     """Training configuration."""
@@ -249,17 +310,13 @@ class VectorizedTrainerV2:
         # Vectorized environment
         self.use_cpp_env = config.use_cpp_env and HAS_CPP_ENV
         if self.use_cpp_env:
-            self.vec_env = CppVecEnvWrapper(
+            # Use V2 C++ env with batched opponent inference for full training
+            self.vec_env = CppVecEnvV2Wrapper(
                 config.num_envs,
                 config.starting_stack,
                 config.num_actions
             )
-            # Keep Python env for self-play after warmup
-            self.py_vec_env = VectorizedHeadsUpEnv(
-                config.num_envs,
-                config.starting_stack,
-                config.num_actions
-            )
+            self.py_vec_env = None  # Not needed with V2
         else:
             self.vec_env = VectorizedHeadsUpEnv(
                 config.num_envs,
@@ -340,12 +397,6 @@ class VectorizedTrainerV2:
                     # End warmup, save warmup model for self-play
                     print(f"  [WARMUP] Completed warmup phase, switching to self-play")
 
-                    # Switch from C++ to Python env for self-play (C++ doesn't support NN opponents)
-                    if self.use_cpp_env and self.py_vec_env is not None:
-                        print(f"  [ENV] Switching from C++ to Python env for self-play")
-                        self.vec_env = self.py_vec_env
-                        obs, action_masks = self.vec_env.reset()
-
                     self.warmup_model = ActorCritic(
                         input_channels=50, use_cnn=True, num_actions=self.config.num_actions,
                         fc_hidden_dim=self.config.fc_hidden_dim, fc_num_layers=self.config.fc_num_layers
@@ -353,7 +404,9 @@ class VectorizedTrainerV2:
                     self.warmup_model.load_state_dict(self.model.state_dict())
                     self.warmup_model.eval()
                     self.opponent = self.warmup_model
-                    self.vec_env.set_opponent(self._opponent_policy)
+
+                    # Set batched opponent policy (works with both Python and C++ V2 env)
+                    self.vec_env.set_opponent(self._batched_opponent_policy)
                     self.in_warmup = False
                     self._current_opp_elo = self.config.initial_elo
 
@@ -477,7 +530,7 @@ class VectorizedTrainerV2:
         }
 
     def _opponent_policy(self, obs: np.ndarray, action_mask: np.ndarray) -> int:
-        """Opponent policy with exploration noise."""
+        """Opponent policy with exploration noise (single observation)."""
         if self.opponent is None:
             valid = np.where(action_mask)[0]
             return np.random.choice(valid)
@@ -500,6 +553,36 @@ class VectorizedTrainerV2:
             action = dist.sample()
             return action.item()
 
+    def _batched_opponent_policy(self, obs_batch: np.ndarray, mask_batch: np.ndarray) -> np.ndarray:
+        """Batched opponent policy for efficient GPU inference."""
+        batch_size = obs_batch.shape[0]
+
+        if self.opponent is None:
+            # Random actions for each observation
+            actions = np.zeros(batch_size, dtype=np.int32)
+            for i in range(batch_size):
+                valid = np.where(mask_batch[i])[0]
+                actions[i] = np.random.choice(valid) if len(valid) > 0 else 1
+            return actions
+
+        with torch.no_grad():
+            obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=self.device)
+            mask_tensor = torch.tensor(mask_batch, dtype=torch.bool, device=self.device)
+
+            # Batched forward pass - single GPU call for all opponents
+            logits, _ = self.opponent(obs_tensor, mask_tensor)
+            probs = torch.softmax(logits, dim=-1)
+
+            # Small exploration
+            probs = probs * 0.95 + 0.05 / self.config.num_actions
+            # Re-apply mask
+            probs = probs * mask_tensor.float()
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+
+            dist = torch.distributions.Categorical(probs)
+            actions = dist.sample()
+            return actions.cpu().numpy().astype(np.int32)
+
     def _update_opponent(self):
         """Update opponent from pool or use self-play."""
         if len(self.opponent_pool.agents) == 0:
@@ -513,7 +596,7 @@ class VectorizedTrainerV2:
                 self.opponent = opponent.to(self.device)
                 self.opponent.eval()
                 self._current_opp_elo = agent_info['elo']
-                self.vec_env.set_opponent(self._opponent_policy)
+                self.vec_env.set_opponent(self._batched_opponent_policy)
                 print(f"  [OPPONENT] Switched to agent_{agent_info['update_num']} (ELO={agent_info['elo']:.0f})")
 
     def _evaluate_for_pool(self):
